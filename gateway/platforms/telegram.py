@@ -5381,6 +5381,24 @@ class TelegramAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    def _telegram_always_process_voice_from_user_ids(self) -> set[str]:
+        """Return user ids whose Telegram voice messages bypass mention gating."""
+        raw = self.config.extra.get("always_process_voice_from_user_ids")
+        if raw is None:
+            raw = self.config.extra.get("voice_always_listen_user_ids")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_ALWAYS_PROCESS_VOICE_FROM_USER_IDS", "")
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _should_always_process_voice_message(self, message: Message) -> bool:
+        if not getattr(message, "voice", None):
+            return False
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        return bool(user_id and user_id in self._telegram_always_process_voice_from_user_ids())
+
     def _is_guest_mention(self, message: Message) -> bool:
         """Return True for the narrow guest-mode bypass: explicit bot mention.
 
@@ -5395,6 +5413,34 @@ class TelegramAdapter(BasePlatformAdapter):
         username = re.escape(self._bot.username)
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
+
+    @staticmethod
+    def _contains_telegram_internal_message_link(text: str) -> bool:
+        return bool(re.search(r"(?i)https?://t\.me/(?:c/\d+/\d+|[A-Za-z0-9_]+/\d+)\b", text or ""))
+
+    def _is_aivocado_link_request(self, message: Any) -> bool:
+        """Return True for external links/videos that should be summarized.
+
+        Telegram message permalinks point to chat history, not an external
+        article/video source.  They need Telegram-message resolution instead of
+        the generic web summarizer path.
+        """
+        text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        if self._contains_telegram_internal_message_link(text):
+            stripped = re.sub(
+                r"(?i)https?://t\.me/(?:c/\d+/\d+|[A-Za-z0-9_]+/\d+)\b",
+                "",
+                text,
+            )
+            if not re.search(r"https?://|youtu\.be/|youtube\.com/", stripped, re.IGNORECASE):
+                return False
+        if re.search(r"https?://|youtu\.be/|youtube\.com/", text, re.IGNORECASE):
+            return True
+        if getattr(message, "video", None) or getattr(message, "video_note", None) or getattr(message, "animation", None):
+            return True
+        document = getattr(message, "document", None)
+        mime_type = str(getattr(document, "mime_type", "") or "") if document else ""
+        return mime_type.startswith("video/")
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
@@ -5731,6 +5777,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if guest_mention:
             return True
         if chat_id_str in self._telegram_free_response_chats():
+            return True
+        if self._should_always_process_voice_message(message):
             return True
         if not self._telegram_require_mention():
             return True

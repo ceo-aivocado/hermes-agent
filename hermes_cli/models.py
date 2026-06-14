@@ -71,6 +71,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # NVIDIA
     ("nvidia/nemotron-3-super-120b-a12b",      ""),
     # OpenRouter routers
+    ("openrouter/fusion",                       "multi-model deliberation router"),
     ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
     # Free tier
     ("openrouter/elephant-alpha",              "free"),
@@ -1287,6 +1288,23 @@ def _openrouter_model_is_free(pricing: Any) -> bool:
         return False
 
 
+_OPENROUTER_AGENTIC_ROUTER_MODELS = frozenset({
+    "openrouter/fusion",
+    "openrouter/pareto-code",
+})
+
+
+def _ensure_openrouter_router_models(models: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep first-class OpenRouter router slugs visible if the remote manifest lags."""
+    seen = {mid for mid, _ in models}
+    out = list(models)
+    for mid, desc in OPENROUTER_MODELS:
+        if mid in _OPENROUTER_AGENTIC_ROUTER_MODELS and mid not in seen:
+            out.append((mid, desc))
+            seen.add(mid)
+    return out
+
+
 def _openrouter_model_supports_tools(item: Any) -> bool:
     """Return True when the model's ``supported_parameters`` advertise tool calling.
 
@@ -1304,6 +1322,14 @@ def _openrouter_model_supports_tools(item: Any) -> bool:
     Ported from Kilo-Org/kilocode#9068.
     """
     if not isinstance(item, dict):
+        return True
+    mid = str(item.get("id") or "").strip().lower()
+    if mid in _OPENROUTER_AGENTIC_ROUTER_MODELS:
+        # OpenRouter routers expose synthetic model slugs whose catalog rows
+        # currently report supported_parameters=[] even though the chat
+        # completions endpoint handles them as first-class agentic routes.
+        # Keep those curated router slugs selectable while still dropping
+        # arbitrary non-tool models that explicitly omit `tools`.
         return True
     params = item.get("supported_parameters")
     if not isinstance(params, list):
@@ -1332,7 +1358,7 @@ def fetch_openrouter_models(
         remote = get_curated_openrouter_models()
     except Exception:
         remote = None
-    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+    fallback = _ensure_openrouter_router_models(list(remote) if remote else list(OPENROUTER_MODELS))
     preferred_ids = [mid for mid, _ in fallback]
 
     try:

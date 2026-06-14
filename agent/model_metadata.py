@@ -238,6 +238,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # Arcee
     "trinity": 262144,
     # OpenRouter
+    "openrouter/fusion": 128000,
     "elephant": 262144,
     # Hugging Face Inference Providers — model IDs use org/name format
     "Qwen/Qwen3.5-397B-A17B": 131072,

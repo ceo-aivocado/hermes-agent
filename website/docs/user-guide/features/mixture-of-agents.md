@@ -41,6 +41,22 @@ moa:
   max_tokens: 4096
 ```
 
+OpenRouter router slugs are valid model choices here too. For example, you can
+use OpenRouter Fusion as a reference model or as the MoA aggregator with:
+
+```yaml
+moa:
+  reference_models:
+    - provider: openrouter
+      model: openrouter/fusion
+  aggregator:
+    provider: openrouter
+    model: openrouter/fusion
+```
+
+That uses OpenRouter's Fusion Router as a normal OpenRouter model slug; Hermes
+does not add a separate Fusion tool or config surface.
+
 Defaults use one Codex OAuth model and two OpenRouter-hosted models for high-signal testing:
 
 - `openai-codex:gpt-5.5`

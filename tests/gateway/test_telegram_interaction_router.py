@@ -1,0 +1,183 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType
+
+
+def _make_adapter(
+    *,
+    require_mention=True,
+    allowed_chats=None,
+    group_allowed_chats=None,
+    observe_unmentioned_group_messages=False,
+    voice_user_ids=None,
+):
+    from gateway.platforms.telegram import TelegramAdapter
+
+    extra = {
+        "require_mention": require_mention,
+        "allowed_chats": allowed_chats or [],
+        "group_allowed_chats": group_allowed_chats or allowed_chats or [],
+        "allowed_topics": [],
+        "observe_unmentioned_group_messages": observe_unmentioned_group_messages,
+    }
+    if voice_user_ids is not None:
+        extra["always_process_voice_from_user_ids"] = voice_user_ids
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(enabled=True, token="***", extra=extra)
+    adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
+    adapter._message_handler = AsyncMock()
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 0.01
+    adapter._text_batch_split_delay_seconds = 0.01
+    adapter._mention_patterns = adapter._compile_mention_patterns()
+    adapter._forum_lock = asyncio.Lock()
+    adapter._forum_command_registered = set()
+    adapter._active_sessions = {}
+    adapter._pending_messages = {}
+    adapter._max_doc_bytes = 20 * 1024 * 1024
+    adapter._is_callback_user_authorized = lambda user_id, **_kw: True
+    return adapter
+
+
+def _mention_entity(text, mention="@hermes_bot"):
+    return SimpleNamespace(type="mention", offset=text.index(mention), length=len(mention))
+
+
+def _chat(chat_id=-100):
+    return SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=False)
+
+
+def _user(user_id=111, name="Alice Example"):
+    return SimpleNamespace(id=user_id, full_name=name, first_name=name.split()[0])
+
+
+def _group_text(text, *, chat_id=-100, user_id=111, entities=None):
+    return SimpleNamespace(
+        message_id=42,
+        text=text,
+        caption=None,
+        entities=entities or [],
+        caption_entities=[],
+        message_thread_id=None,
+        is_topic_message=False,
+        chat=_chat(chat_id),
+        from_user=_user(user_id),
+        reply_to_message=None,
+        date=None,
+    )
+
+
+def _voice_payload(data=b"voice-bytes"):
+    file_obj = SimpleNamespace(download_as_bytearray=AsyncMock(return_value=bytearray(data)))
+    return SimpleNamespace(file_size=len(data), get_file=AsyncMock(return_value=file_obj))
+
+
+def _group_voice(*, chat_id=-100, user_id=10954083):
+    return SimpleNamespace(
+        message_id=43,
+        text=None,
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        is_topic_message=False,
+        chat=_chat(chat_id),
+        from_user=_user(user_id),
+        reply_to_message=None,
+        date=None,
+        sticker=None,
+        photo=None,
+        video=None,
+        audio=None,
+        voice=_voice_payload(),
+        document=None,
+    )
+
+
+def test_router_marks_mention_only_as_context_needed_dispatch():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    text = "@hermes_bot"
+    msg = _group_text(text, entities=[_mention_entity(text)])
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "context_needed"
+    assert decision.reason == "mention_only"
+    assert decision.needs_context is True
+
+
+def test_router_observes_unmentioned_allowed_group_context_without_dispatch():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    msg = _group_text("side context")
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "observe"
+    assert decision.intent == "group_context"
+    assert decision.reason == "unmentioned_group_context"
+
+
+def test_router_classifies_owner_voice_as_voice_stt_dispatch():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        voice_user_ids=["10954083"],
+    )
+
+    decision = adapter._telegram_interaction_decision(_group_voice(), msg_type=MessageType.VOICE)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "voice_stt"
+    assert decision.reason == "owner_voice_allowlist"
+
+
+def test_router_ignores_other_user_voice_without_tag_or_workflow():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        voice_user_ids=["10954083"],
+    )
+
+    decision = adapter._telegram_interaction_decision(
+        _group_voice(user_id=222),
+        msg_type=MessageType.VOICE,
+    )
+
+    assert decision.action == "ignore"
+    assert decision.intent == "ignored"
+
+
+def test_router_classifies_telegram_internal_link_for_resolver_not_summary():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    text = "@hermes_bot https://t.me/c/3716216649/2895"
+    msg = _group_text(text, entities=[_mention_entity(text)])
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "telegram_message_link"
+    assert decision.reason == "telegram_internal_link"
+
+
+def test_router_classifies_external_link_summary_request():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    text = "@hermes_bot https://example.com/article"
+    msg = _group_text(text, entities=[_mention_entity(text)])
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "link_summary"
+    assert decision.reason == "external_link"

@@ -109,6 +109,17 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 MAX_COMMANDS_PER_SCOPE = 30
 
 
+@dataclasses.dataclass(frozen=True)
+class TelegramInteractionDecision:
+    """Decision returned by Telegram's inbound interaction router."""
+
+    action: str
+    intent: str
+    reason: str
+    message_type: Optional[MessageType] = None
+    needs_context: bool = False
+
+
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available.
 
@@ -4858,14 +4869,15 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             chat = await self._bot.get_chat(int(chat_id))
             
+            telegram_chat_type = self._telegram_chat_type_name(getattr(chat, "type", None))
             chat_type = "dm"
-            if chat.type == ChatType.GROUP:
+            if telegram_chat_type == "group":
                 chat_type = "group"
-            elif chat.type == ChatType.SUPERGROUP:
+            elif telegram_chat_type == "supergroup":
                 chat_type = "group"
                 if chat.is_forum:
                     chat_type = "forum"
-            elif chat.type == ChatType.CHANNEL:
+            elif telegram_chat_type == "channel":
                 chat_type = "channel"
             
             return {
@@ -5223,11 +5235,27 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[%s] Loaded %d Telegram mention pattern(s)", self.name, len(compiled))
         return compiled
 
+    @staticmethod
+    def _telegram_chat_type_name(chat_type: Any) -> str:
+        raw = getattr(chat_type, "value", chat_type)
+        if raw is None:
+            return ""
+        text = str(raw).strip().lower()
+        if "supergroup" in text:
+            return "supergroup"
+        if "group" in text:
+            return "group"
+        if "channel" in text:
+            return "channel"
+        if "private" in text:
+            return "private"
+        return text.split(".")[-1]
+
     def _is_group_chat(self, message: Message) -> bool:
         chat = getattr(message, "chat", None)
         if not chat:
             return False
-        chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = self._telegram_chat_type_name(getattr(chat, "type", None))
         return chat_type in {"group", "supergroup"}
 
     def _is_reply_to_bot(self, message: Message) -> bool:
@@ -5441,6 +5469,85 @@ class TelegramAdapter(BasePlatformAdapter):
         document = getattr(message, "document", None)
         mime_type = str(getattr(document, "mime_type", "") or "") if document else ""
         return mime_type.startswith("video/")
+
+    @staticmethod
+    def _telegram_message_text(message: Message) -> str:
+        return getattr(message, "text", None) or getattr(message, "caption", None) or ""
+
+    def _telegram_text_after_bot_trigger(self, message: Message) -> str:
+        """Return text remaining after removing this bot's direct @mention."""
+        text = self._telegram_message_text(message)
+        if not text or not self._bot or not getattr(self._bot, "username", None):
+            return text.strip()
+        if not self._message_mentions_bot(message):
+            return text.strip()
+        username = re.escape(self._bot.username)
+        return re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+
+    def _telegram_dispatch_interaction_decision(
+        self,
+        message: Message,
+        msg_type: MessageType,
+        *,
+        is_command: bool = False,
+    ) -> TelegramInteractionDecision:
+        if is_command or msg_type == MessageType.COMMAND:
+            return TelegramInteractionDecision("dispatch", "command", "command", msg_type)
+
+        reply_msg = getattr(message, "reply_to_message", None)
+        if getattr(reply_msg, "voice", None):
+            return TelegramInteractionDecision("dispatch", "voice_stt", "replied_voice", msg_type)
+
+        if msg_type == MessageType.VOICE or getattr(message, "voice", None):
+            reason = "owner_voice_allowlist" if self._should_always_process_voice_message(message) else "addressed_voice"
+            return TelegramInteractionDecision("dispatch", "voice_stt", reason, msg_type)
+
+        text = self._telegram_message_text(message)
+        if self._contains_telegram_internal_message_link(text):
+            return TelegramInteractionDecision("dispatch", "telegram_message_link", "telegram_internal_link", msg_type)
+        if self._is_aivocado_link_request(message):
+            return TelegramInteractionDecision("dispatch", "link_summary", "external_link", msg_type)
+
+        if msg_type == MessageType.TEXT and self._message_mentions_bot(message):
+            if not self._telegram_text_after_bot_trigger(message):
+                return TelegramInteractionDecision(
+                    "dispatch",
+                    "context_needed",
+                    "mention_only",
+                    msg_type,
+                    needs_context=True,
+                )
+
+        if msg_type != MessageType.TEXT:
+            return TelegramInteractionDecision("dispatch", "media", "addressed_media", msg_type)
+        return TelegramInteractionDecision("dispatch", "text", "addressed_text", msg_type)
+
+    def _telegram_interaction_decision(
+        self,
+        message: Message,
+        *,
+        msg_type: Optional[MessageType] = None,
+        is_command: bool = False,
+    ) -> TelegramInteractionDecision:
+        """Classify an inbound Telegram update before dispatch/observe/ignore.
+
+        This centralizes the product-facing interaction decision while keeping
+        the existing admission gates intact. Later feature slices can add
+        context-window and task-routing behavior here without spreading that
+        policy across every Telegram handler.
+        """
+        if msg_type is None:
+            msg_type = MessageType.COMMAND if is_command else MessageType.TEXT
+
+        if self._should_process_message(message, is_command=is_command):
+            return self._telegram_dispatch_interaction_decision(
+                message,
+                msg_type,
+                is_command=is_command,
+            )
+        if self._should_observe_unmentioned_group_message(message):
+            return TelegramInteractionDecision("observe", "group_context", "unmentioned_group_context", msg_type)
+        return TelegramInteractionDecision("ignore", "ignored", "not_addressed", msg_type)
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
         """Return True when a group message should be stored but not dispatched."""
@@ -5835,11 +5942,12 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg):
-            if self._should_observe_unmentioned_group_message(msg):
+        decision = self._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+        if decision.action != "dispatch":
+            if decision.action == "observe":
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
-        await self._ensure_forum_commands(update.message)
+        await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
@@ -5852,7 +5960,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg, is_command=True):
+        decision = self._telegram_interaction_decision(msg, msg_type=MessageType.COMMAND, is_command=True)
+        if decision.action != "dispatch":
             return
         await self._ensure_forum_commands(msg)
 
@@ -5867,8 +5976,9 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg:
             return
-        if not self._should_process_message(msg):
-            if self._should_observe_unmentioned_group_message(msg):
+        decision = self._telegram_interaction_decision(msg, msg_type=MessageType.LOCATION)
+        if decision.action != "dispatch":
+            if decision.action == "observe":
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
             return
 
@@ -6049,11 +6159,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming media messages, downloading images to local cache."""
         if not update.message:
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
+        msg_type = self._media_message_type(update.message)
+        decision = self._telegram_interaction_decision(update.message, msg_type=msg_type)
+        if decision.action != "dispatch":
+            if decision.action == "observe":
                 _m = update.message
-                _observe_type = self._media_message_type(_m)
-                _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
+                _event = self._build_message_event(_m, msg_type, update_id=update.update_id)
                 if _m.caption:
                     _event.text = self._clean_bot_trigger_text(_m.caption)
                 await self._cache_observed_media(_m, _event)
@@ -6063,8 +6174,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         msg = update.message
-
-        msg_type = self._media_message_type(msg)
 
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
         
@@ -6530,7 +6639,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        telegram_chat_type = self._telegram_chat_type_name(getattr(chat, "type", None))
         chat_type = "dm"
         if telegram_chat_type in {"group", "supergroup"}:
             chat_type = "group"

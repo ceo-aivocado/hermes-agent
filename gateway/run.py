@@ -7828,6 +7828,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # missed the leftover real agent — locking the session out forever (#28686).
             self._release_running_agent_state(_quick_key)
 
+    @staticmethod
+    def _coerce_csv_string_set(raw: Any) -> set[str]:
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_owner_voice_user_ids(self) -> set[str]:
+        raw: Any = None
+        platform_cfg = getattr(getattr(self, "config", None), "platforms", {}).get(Platform.TELEGRAM)
+        if platform_cfg is not None:
+            extra = getattr(platform_cfg, "extra", {}) or {}
+            raw = extra.get("always_process_voice_from_user_ids")
+            if raw is None:
+                raw = extra.get("voice_always_listen_user_ids")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_ALWAYS_PROCESS_VOICE_FROM_USER_IDS", "")
+        return self._coerce_csv_string_set(raw)
+
+    def _is_telegram_owner_group_voice_event(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> bool:
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        if getattr(source, "chat_type", None) == "dm":
+            return False
+        if getattr(event, "message_type", None) != MessageType.VOICE:
+            return False
+        user_id = str(getattr(source, "user_id", "") or "")
+        if not user_id:
+            raw_user = getattr(getattr(event, "raw_message", None), "from_user", None)
+            user_id = str(getattr(raw_user, "id", "") or "")
+        return bool(user_id and user_id in self._telegram_owner_voice_user_ids())
+
+    def _voice_transcript_addresses_bot(self, transcript: str) -> bool:
+        text = str(transcript or "")
+        if not text.strip():
+            return False
+        adapter = getattr(self, "adapters", {}).get(Platform.TELEGRAM)
+        bot_username = getattr(getattr(adapter, "_bot", None), "username", None)
+        if bot_username and re.search(rf"(?iu)@{re.escape(str(bot_username))}\b", text):
+            return True
+        return bool(
+            re.search(
+                r"(?iu)(?:^|[^\w])(?:авокадо|айвокадо|аивокадо|aivocado|ai\s*vocado|hermes|гермес)(?:[^\w]|$)",
+                text,
+            )
+        )
+
+    def _should_silence_telegram_owner_voice(
+        self,
+        *,
+        event: MessageEvent,
+        source: SessionSource,
+        transcripts: list[str],
+    ) -> bool:
+        if not self._is_telegram_owner_group_voice_event(event, source):
+            return False
+        transcript_text = "\n".join(tx for tx in transcripts if str(tx or "").strip())
+        if not transcript_text:
+            return False
+        return not self._voice_transcript_addresses_bot(transcript_text)
+
+    def _should_publish_voice_transcript_echo(self, source: SessionSource) -> bool:
+        # Raw STT is internal context for routing/agent reasoning. Publishing it
+        # leaks voice content and can make a non-addressed voice look like a bot
+        # response, so transcript echo is disabled across gateway paths.
+        return False
+
     async def _prepare_inbound_message_text(
         self,
         *,
@@ -7928,10 +8000,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     audio_paths,
                 )
-                # Echo each successful transcript back to the user immediately,
-                # before the agent loop runs. Lets the user verify STT quality
-                # in real-time and see the raw whisper output verbatim.
-                if _successful_transcripts:
+                if self._should_silence_telegram_owner_voice(
+                    event=event,
+                    source=source,
+                    transcripts=_successful_transcripts,
+                ):
+                    logger.info(
+                        "Silencing Telegram owner voice without bot address: chat=%s user=%s",
+                        getattr(source, "chat_id", ""),
+                        getattr(source, "user_id", ""),
+                    )
+                    return None
+                if _successful_transcripts and self._should_publish_voice_transcript_echo(source):
                     _echo_adapter = self.adapters.get(source.platform)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
@@ -11990,7 +12070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
               - ``successful_transcripts``: the raw transcript strings for audio
                 clips that were successfully transcribed, in input order. Empty
                 list if every clip failed or STT is disabled. Callers can use
-                this to echo transcripts back to the user before the agent loop.
+                this for internal routing checks without exposing raw STT.
         """
         if not getattr(self.config, "stt_enabled", True):
             notes = []
@@ -12087,8 +12167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         time never runs.
 
         This helper fills that gap: when the dequeued event has audio media,
-        we transcribe inline, echo the raw transcript back to the user (same
-        "🎙️" format as the fresh-message path), and return enriched text.
+        we transcribe inline and return enriched text. Raw STT stays internal.
         Non-audio events fall back to _build_media_placeholder, matching the
         original _dequeue_pending_text behavior.
         """
@@ -12114,9 +12193,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
             )
-            # Echo raw transcripts back to the user so voice interrupts
-            # feel identical to fresh voice messages.
-            if successful_transcripts:
+            event_source = getattr(event, "source", None) or source
+            if self._should_silence_telegram_owner_voice(
+                event=event,
+                source=event_source,
+                transcripts=successful_transcripts,
+            ):
+                logger.info(
+                    "Silencing queued Telegram owner voice without bot address: chat=%s user=%s",
+                    getattr(event_source, "chat_id", ""),
+                    getattr(event_source, "user_id", ""),
+                )
+                return None
+            if successful_transcripts and self._should_publish_voice_transcript_echo(source):
                 echo_adapter = self.adapters.get(source.platform)
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 if echo_adapter:
@@ -15117,9 +15206,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # Transcribe audio media BEFORE signaling the
                                 # agent, so voice messages interrupt with the
                                 # real transcript instead of an empty string
-                                # (or file-path placeholder). Matches the UX
-                                # of fresh voice messages including the
-                                # 🎙️ echo back to the user.
+                                # (or file-path placeholder). Raw STT remains
+                                # internal and is never echoed to chat.
                                 _media_urls = getattr(_peek_event, "media_urls", None) or []
                                 _media_types = getattr(_peek_event, "media_types", None) or []
                                 _audio_paths = []
@@ -15136,8 +15224,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _enriched, _transcripts = await self._enrich_message_with_transcription(
                                             pending_text, _audio_paths,
                                         )
+                                        _peek_source = getattr(_peek_event, "source", None) or source
+                                        if self._should_silence_telegram_owner_voice(
+                                            event=_peek_event,
+                                            source=_peek_source,
+                                            transcripts=_transcripts,
+                                        ):
+                                            logger.info(
+                                                "Silencing interrupting Telegram owner voice without bot address: chat=%s user=%s",
+                                                getattr(_peek_source, "chat_id", ""),
+                                                getattr(_peek_source, "user_id", ""),
+                                            )
+                                            try:
+                                                _adapter._pending_messages.pop(session_key, None)
+                                            except Exception:
+                                                pass
+                                            continue
                                         pending_text = _enriched
-                                        if _transcripts:
+                                        if _transcripts and self._should_publish_voice_transcript_echo(source):
                                             _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                                             for _tx in _transcripts:
                                                 try:
@@ -15484,9 +15588,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Transcribe audio media on the dequeued event BEFORE it is
                     # handed back as the next user turn, so queued/interrupting
                     # voice messages drain with the real transcript instead of
-                    # a file-path placeholder. Echo each transcript back to the
-                    # user (same 🎙️ format as fresh voice messages) so voice
-                    # interrupts feel identical to text interrupts.
+                    # a file-path placeholder. Raw STT remains internal and is
+                    # never echoed to chat.
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
                     _media_types = getattr(pending_event, "media_types", None) or []
@@ -15504,8 +15607,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _enriched, _transcripts = await self._enrich_message_with_transcription(
                                 _pending_text, _audio_paths,
                             )
-                            pending = _enriched or None
-                            if _transcripts:
+                            _pending_source = getattr(pending_event, "source", None) or source
+                            if self._should_silence_telegram_owner_voice(
+                                event=pending_event,
+                                source=_pending_source,
+                                transcripts=_transcripts,
+                            ):
+                                logger.info(
+                                    "Silencing drained Telegram owner voice without bot address: chat=%s user=%s",
+                                    getattr(_pending_source, "chat_id", ""),
+                                    getattr(_pending_source, "user_id", ""),
+                                )
+                                pending = None
+                                pending_event = None
+                            else:
+                                pending = _enriched or None
+                            if pending_event is not None and _transcripts and self._should_publish_voice_transcript_echo(source):
                                 _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                                 for _tx in _transcripts:
                                     try:

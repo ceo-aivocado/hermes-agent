@@ -5474,6 +5474,40 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_message_text(message: Message) -> str:
         return getattr(message, "text", None) or getattr(message, "caption", None) or ""
 
+    def _annotate_telegram_interaction_event(
+        self,
+        event: MessageEvent,
+        decision: TelegramInteractionDecision,
+        message: Message,
+    ) -> MessageEvent:
+        """Carry Telegram router context across the adapter/gateway boundary."""
+        event.telegram_interaction_action = decision.action  # type: ignore[attr-defined]
+        event.telegram_interaction_intent = decision.intent  # type: ignore[attr-defined]
+        event.telegram_interaction_reason = decision.reason  # type: ignore[attr-defined]
+        event.telegram_direct_bot_mention = self._message_mentions_bot(message)  # type: ignore[attr-defined]
+        event.telegram_needs_context = decision.needs_context  # type: ignore[attr-defined]
+        return event
+
+    def _apply_telegram_link_summary_hint(
+        self,
+        event: MessageEvent,
+        decision: TelegramInteractionDecision,
+    ) -> MessageEvent:
+        """Make link-summary dispatch explicit for the downstream agent turn."""
+        if decision.intent != "link_summary":
+            return event
+        original = (event.text or "").strip()
+        if original.startswith("[Telegram external link summary request]"):
+            return event
+        guidance = (
+            "[Telegram external link summary request]\n"
+            "Fetch/read the external source(s) in this Telegram message and produce a concise synopsis. "
+            "If a knowledge-base or Google Sheet workflow is configured for this chat, record the processed "
+            "source there and surface any write failure.\n\n"
+        )
+        event.text = f"{guidance}{original}".strip()
+        return event
+
     def _telegram_text_after_bot_trigger(self, message: Message) -> str:
         """Return text remaining after removing this bot's direct @mention."""
         text = self._telegram_message_text(message)
@@ -5987,6 +6021,8 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._annotate_telegram_interaction_event(event, decision, msg)
+        event = self._apply_telegram_link_summary_hint(event, decision)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6003,6 +6039,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._annotate_telegram_interaction_event(event, decision, msg)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6044,6 +6081,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._annotate_telegram_interaction_event(event, decision, msg)
         await self.handle_message(event)
 
     # ------------------------------------------------------------------
@@ -6219,12 +6257,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
+            event = self._annotate_telegram_interaction_event(event, decision, msg)
             await self.handle_message(event)
             return
 
         # Apply observe attribution after caption is set; sticker is handled above
         # because _handle_sticker overwrites event.text with its vision description.
         event = self._apply_telegram_group_observe_attribution(event)
+        event = self._annotate_telegram_interaction_event(event, decision, msg)
+        event = self._apply_telegram_link_summary_hint(event, decision)
 
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).

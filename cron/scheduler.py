@@ -156,6 +156,26 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+_AIVA_ARCHIVE_REPORT_REQUIRED_TERMS = (
+    "ai сфера",
+    "aisphere",
+    "iasphere",
+)
+
+_AIVA_ARCHIVE_REPORT_MARKERS = (
+    "автообработка ссылок",
+    "база знаний",
+    "финальный отч",
+    "результаты сканирования",
+    "найдено новых необработанных url",
+    "успешно извлечено",
+    "backend-таблица",
+    "продолжил задачу по базе знаний",
+    "google workspace",
+)
+
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -656,6 +676,35 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _is_aiva_archive_report(job: dict, delivery_content: str) -> bool:
+    text = "\n".join(
+        str(part or "")
+        for part in (
+            job.get("name"),
+            job.get("prompt"),
+            job.get("id"),
+            delivery_content,
+        )
+    ).casefold()
+    if not any(term in text for term in _AIVA_ARCHIVE_REPORT_REQUIRED_TERMS):
+        return False
+    return any(marker in text for marker in _AIVA_ARCHIVE_REPORT_MARKERS)
+
+
+def _should_suppress_quiet_cron_report_delivery(
+    job: dict,
+    target: dict,
+    delivery_content: str,
+) -> bool:
+    """Suppress known background report spam while preserving the cron run."""
+    if str(target.get("platform", "")).lower() != "telegram":
+        return False
+    force_reports = os.getenv("HERMES_CRON_DELIVER_AIVA_ARCHIVE_REPORTS", "").strip().lower()
+    if force_reports in _TRUE_ENV_VALUES:
+        return False
+    return _is_aiva_archive_report(job, delivery_content)
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -719,6 +768,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        if _should_suppress_quiet_cron_report_delivery(job, target, cleaned_delivery_content):
+            logger.info(
+                "Job '%s': suppressed quiet cron report delivery to %s:%s",
+                job["id"],
+                platform_name,
+                chat_id,
+            )
+            continue
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}

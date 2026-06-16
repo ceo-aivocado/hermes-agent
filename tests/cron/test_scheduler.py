@@ -549,6 +549,38 @@ class TestDeliverResultWrapping:
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
         assert "Cronjob Response: abc-123" in sent_content
 
+    def test_aiva_archive_cron_report_is_not_posted_to_telegram(self, caplog):
+        """Ai Sphere archive maintenance jobs should not spam the source chat."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        job = {
+            "id": "d2ff51f55185",
+            "name": "AI Сфера — автообработка ссылок",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "-1003716216649"},
+        }
+        report = (
+            "Финальный отчёт:\n\n"
+            "📊 AI Сфера — автообработка ссылок (15 июня 2026, ~19:00 UTC)\n\n"
+            "🔍 Результаты сканирования\n"
+            "Найдено новых необработанных URL: 6\n"
+            "Успешно извлечено и законспектировано: 5"
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             caplog.at_level(logging.INFO, logger="cron.scheduler"):
+            result = _deliver_result(job, report)
+
+        assert result is None
+        send_mock.assert_not_called()
+        assert any("suppressed quiet cron report delivery" in r.message for r in caplog.records)
+
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
         from gateway.config import Platform

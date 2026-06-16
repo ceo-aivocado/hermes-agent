@@ -5522,6 +5522,34 @@ class TelegramAdapter(BasePlatformAdapter):
             return TelegramInteractionDecision("dispatch", "media", "addressed_media", msg_type)
         return TelegramInteractionDecision("dispatch", "text", "addressed_text", msg_type)
 
+    def _should_auto_dispatch_link_summary(self, message: Message) -> bool:
+        """Allow explicit source drops in approved groups without a bot mention."""
+        if not self._is_group_chat(message):
+            return False
+        if not self._is_aivocado_link_request(message):
+            return False
+
+        thread_id = getattr(message, "message_thread_id", None)
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
+            if topic_id not in allowed_topics:
+                return False
+
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return False
+            except (TypeError, ValueError):
+                return False
+
+        if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
+            return False
+
+        chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        allowed = self._telegram_allowed_chats()
+        return bool(allowed and chat_id_str in allowed)
+
     def _telegram_interaction_decision(
         self,
         message: Message,
@@ -5539,6 +5567,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg_type is None:
             msg_type = MessageType.COMMAND if is_command else MessageType.TEXT
 
+        if self._should_auto_dispatch_link_summary(message):
+            return self._telegram_dispatch_interaction_decision(
+                message,
+                msg_type,
+                is_command=is_command,
+            )
         if self._should_process_message(message, is_command=is_command):
             return self._telegram_dispatch_interaction_decision(
                 message,

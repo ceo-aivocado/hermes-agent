@@ -100,6 +100,30 @@ def _group_voice(*, chat_id=-100, user_id=10954083):
     )
 
 
+def _group_video(*, chat_id=-100, user_id=111):
+    return SimpleNamespace(
+        message_id=44,
+        text=None,
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        is_topic_message=False,
+        chat=_chat(chat_id),
+        from_user=_user(user_id),
+        reply_to_message=None,
+        date=None,
+        sticker=None,
+        photo=None,
+        video=SimpleNamespace(file_size=1024),
+        audio=None,
+        voice=None,
+        document=None,
+        animation=None,
+        video_note=None,
+    )
+
+
 def test_router_marks_mention_only_as_context_needed_dispatch():
     adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
     text = "@hermes_bot"
@@ -181,3 +205,34 @@ def test_router_classifies_external_link_summary_request():
     assert decision.action == "dispatch"
     assert decision.intent == "link_summary"
     assert decision.reason == "external_link"
+
+
+def test_router_dispatches_unmentioned_external_link_in_allowed_group():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    msg = _group_text("https://example.com/article")
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "link_summary"
+    assert decision.reason == "external_link"
+
+
+def test_router_dispatches_unmentioned_video_in_allowed_group():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+
+    decision = adapter._telegram_interaction_decision(_group_video(), msg_type=MessageType.VIDEO)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "link_summary"
+    assert decision.reason == "external_link"
+
+
+def test_router_ignores_unmentioned_external_link_outside_allowed_group():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-200"])
+    msg = _group_text("https://example.com/article")
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "ignore"
+    assert decision.intent == "ignored"

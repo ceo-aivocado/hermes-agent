@@ -16,21 +16,39 @@ from unittest.mock import patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
-def _make_runner(stt_enabled: bool = True) -> "GatewayRunner":  # type: ignore[name-defined]
+def _make_runner(
+    stt_enabled: bool = True,
+    *,
+    telegram_extra: dict | None = None,
+) -> "GatewayRunner":  # type: ignore[name-defined]
     from gateway.run import GatewayRunner
 
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.config = GatewayConfig(stt_enabled=stt_enabled)
+    if telegram_extra is not None:
+        runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+            enabled=True,
+            token="***",
+            extra=telegram_extra,
+        )
     runner.adapters = {}
     runner._model = "test-model"
     runner._base_url = ""
     runner._has_setup_skill = lambda: False
     return runner
+
+
+class _RecordingAdapter:
+    def __init__(self):
+        self.sent: list[tuple[str, str, dict | None]] = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append((chat_id, content, metadata))
 
 
 def _voice_event(path: str = "/tmp/voice.ogg") -> MessageEvent:
@@ -77,6 +95,116 @@ async def test_voice_message_still_transcribed():
     mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
     assert "hello world" in result
     assert "voice message" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_telegram_voice_transcript_is_not_echoed_to_chat():
+    """Telegram voice STT may feed the agent, but raw transcripts must stay private."""
+    runner = _make_runner(stt_enabled=True)
+    adapter = _RecordingAdapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-100", chat_type="group")
+    event = _voice_event("/tmp/voice.ogg")
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "private voice words",
+            "provider": "whisper",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is not None
+    assert "private voice words" in result
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_owner_group_voice_without_audio_address_is_silent():
+    """Allowed owner voice in a group is only actionable when the audio addresses the bot."""
+    runner = _make_runner(
+        stt_enabled=True,
+        telegram_extra={"always_process_voice_from_user_ids": ["10954083"]},
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="group",
+        user_id="10954083",
+        user_name="АЮ",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "Юра, врать буду я, жду у Сережи экспертизу",
+            "provider": "whisper",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_owner_group_voice_with_audio_address_reaches_agent_without_echo():
+    """If the owner's voice addresses AiVocado, STT is internal context only."""
+    runner = _make_runner(
+        stt_enabled=True,
+        telegram_extra={"always_process_voice_from_user_ids": ["10954083"]},
+    )
+    adapter = _RecordingAdapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-100",
+        chat_type="group",
+        user_id="10954083",
+        user_name="АЮ",
+    )
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={
+            "success": True,
+            "transcript": "Авокадо, посмотри эту ссылку и сделай конспект",
+            "provider": "whisper",
+        },
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    assert result is not None
+    assert "Авокадо, посмотри эту ссылку" in result
+    assert adapter.sent == []
 
 
 # ---------------------------------------------------------------------------

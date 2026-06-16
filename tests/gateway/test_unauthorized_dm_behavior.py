@@ -506,6 +506,46 @@ async def test_handle_message_drops_anonymous_sender_outside_allowlist(monkeypat
     adapter.send.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_telegram_group_direct_mention_unauthorized_sends_policy_notice(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_GROUP_ALLOWED_USERS", "10954083")
+
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="t")},
+    )
+    runner, adapter = _make_runner(Platform.TELEGRAM, config)
+
+    must_not_run = MagicMock(side_effect=AssertionError("auth gate did not drop"))
+    runner._session_key_for_source = must_not_run
+
+    event = MessageEvent(
+        text="can you collect these links?",
+        message_id="m1",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="222",
+            chat_id="-1009999999999",
+            user_name="Other Member",
+            chat_type="group",
+        ),
+    )
+    event.telegram_direct_bot_mention = True
+    event.telegram_interaction_reason = "addressed_text"
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    must_not_run.assert_not_called()
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_awaited_once()
+    content = adapter.send.await_args.args[1]
+    assert "not authorized" in content
+    assert "owner" in content
+    assert "chat" in content
+    assert "sender" in content
+
+
 def test_telegram_group_users_legacy_chat_ids_still_authorize(monkeypatch):
     """Backward-compat: PR #15027 shipped TELEGRAM_GROUP_ALLOWED_USERS as a
     chat-ID allowlist. PR #17686 renamed it to sender IDs and added

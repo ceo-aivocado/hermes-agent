@@ -156,6 +156,67 @@ def test_group_messages_can_be_opened_via_config():
     assert adapter._should_process_message(_group_message("hello everyone")) is True
 
 
+def test_mentioned_youtube_link_is_enqueued_as_link_summary_workflow():
+    async def _run():
+        adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+        captured = []
+        adapter._enqueue_text_event = captured.append
+        text = "@hermes_bot https://www.youtube.com/watch?v=8HjIfT2HYII4&list=PLHhi8ymDMrQbvfYi9Vh4QgIjUSMsAHQdD"
+        update = SimpleNamespace(
+            update_id=1101,
+            message=_group_message(
+                text,
+                from_user_id=222,
+                from_user_name="Valery Pushkar",
+                entities=[_mention_entity(text)],
+            ),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert getattr(event, "telegram_interaction_intent", None) == "link_summary"
+        assert getattr(event, "telegram_direct_bot_mention", None) is True
+        assert "Telegram external link summary request" in event.text
+        assert "Fetch/read" in event.text
+        assert "Google Sheet" in event.text
+        assert "https://www.youtube.com/watch?v=8HjIfT2HYII4" in event.text
+        assert "@hermes_bot" not in event.text
+
+    asyncio.run(_run())
+
+
+def test_direct_mention_from_non_owner_group_user_is_enqueued_with_mention_metadata():
+    async def _run():
+        adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+        captured = []
+        adapter._enqueue_text_event = captured.append
+        text = "@hermes_bot собрать ссылки из нескольких топиков в базу знаний?"
+        update = SimpleNamespace(
+            update_id=1102,
+            message=_group_message(
+                text,
+                from_user_id=333,
+                from_user_name="Other Member",
+                entities=[_mention_entity(text)],
+            ),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert event.source.user_id == "333"
+        assert event.text == "собрать ссылки из нескольких топиков в базу знаний?"
+        assert getattr(event, "telegram_direct_bot_mention", None) is True
+        assert getattr(event, "telegram_interaction_reason", None) == "addressed_text"
+
+    asyncio.run(_run())
+
+
 def test_unmentioned_group_messages_can_be_observed_without_dispatching():
     async def _run():
         adapter = _make_adapter(

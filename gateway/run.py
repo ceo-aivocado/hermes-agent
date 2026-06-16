@@ -6591,6 +6591,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _is_telegram_group_direct_mention_event(self, event: MessageEvent) -> bool:
+        source = event.source
+        return (
+            source.platform == Platform.TELEGRAM
+            and source.chat_type == "group"
+            and bool(getattr(event, "telegram_direct_bot_mention", False))
+        )
+
+    async def _send_telegram_group_unauthorized_mention_notice(self, event: MessageEvent) -> None:
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            return
+        content = (
+            "I saw the direct mention, but this Telegram user/chat is not authorized to use Hermes here. "
+            "The owner needs to allow this chat or this sender before I can answer."
+        )
+        await adapter.send(
+            source.chat_id,
+            content,
+            metadata=self._thread_metadata_for_source(source),
+        )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6673,7 +6696,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
+            # In DMs: offer pairing code. In groups: stay silent except when
+            # Telegram users directly mention the bot and need an explicit
+            # authorization policy notice instead of a reaction-only drop.
+            if self._is_telegram_group_direct_mention_event(event):
+                await self._send_telegram_group_unauthorized_mention_notice(event)
+                return None
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to

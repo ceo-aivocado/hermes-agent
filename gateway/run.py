@@ -358,6 +358,81 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
+_GOOGLE_SHEET_WRITE_NAME_RE = re.compile(
+    r"(?:sheet|spreadsheet).*(?:append|update|write)"
+    r"|(?:append|update|write).*(?:sheet|spreadsheet)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_GOOGLE_SHEET_WRITE_ARGS_RE = re.compile(
+    r"(?:google_api\.py\s+)?sheets\s+(?:append|update)\b"
+    r"|spreadsheets(?:\.values)?\.(?:append|update)\b"
+    r"|google\s+sheets?.{0,80}\b(?:append|update|write)\b"
+    r"|(?:append|update|write).{0,80}\bgoogle\s+sheets?",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_GOOGLE_SHEET_MISSING_NOTICE = (
+    "⚠️ Google Sheet write was not confirmed. The source was summarized, "
+    "but no Sheets append/update tool call was observed."
+)
+
+
+def _stringify_for_gateway_audit(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _agent_messages_include_google_sheet_write(messages: Any) -> bool:
+    """Return True when the agent actually attempted a Google Sheets write."""
+    if not isinstance(messages, list):
+        return False
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        for call in msg.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if isinstance(function, dict):
+                name = _stringify_for_gateway_audit(function.get("name"))
+                args = _stringify_for_gateway_audit(function.get("arguments"))
+                if _GOOGLE_SHEET_WRITE_NAME_RE.search(name):
+                    return True
+                if _GOOGLE_SHEET_WRITE_ARGS_RE.search(args):
+                    return True
+            name = _stringify_for_gateway_audit(call.get("name"))
+            args = " ".join(
+                _stringify_for_gateway_audit(call.get(key))
+                for key in ("arguments", "input", "args")
+            )
+            if _GOOGLE_SHEET_WRITE_NAME_RE.search(name):
+                return True
+            if _GOOGLE_SHEET_WRITE_ARGS_RE.search(args):
+                return True
+    return False
+
+
+def _event_requires_google_sheet_write(event: Any) -> bool:
+    return bool(getattr(event, "telegram_link_summary_requires_sheet_write", False))
+
+
+def _append_google_sheet_missing_notice(response: str) -> str:
+    body = str(response or "").rstrip()
+    if _GOOGLE_SHEET_MISSING_NOTICE in body:
+        return body
+    if not body:
+        return _GOOGLE_SHEET_MISSING_NOTICE
+    return f"{body}\n\n{_GOOGLE_SHEET_MISSING_NOTICE}"
+
+
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery."""
     text = str(message or "").strip()
@@ -8445,10 +8520,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Normally only inject on NEW sessions — ongoing conversations already
+        # have the skill content from the first message.  Some Telegram
+        # workflows are single-turn obligations (e.g. link summary + Sheet
+        # write) and must force-load their skill even in long-lived group
+        # sessions.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
+        _force_auto_skill = bool(getattr(event, "force_auto_skill_injection", False))
+        if (_is_new_session or _force_auto_skill) and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message
@@ -8458,10 +8537,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _loaded = _load_skill_payload(_sname, task_id=_quick_key)
                     if _loaded:
                         _loaded_skill, _skill_dir, _display_name = _loaded
-                        _note = (
-                            f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
-                            f"Follow its instructions for this session.]"
-                        )
+                        if _force_auto_skill and not _is_new_session:
+                            _note = (
+                                f'[IMPORTANT: The "{_display_name}" skill is auto-loaded '
+                                "for this Telegram workflow turn. Follow its instructions "
+                                "for this request, then return to normal chat context.]"
+                            )
+                        else:
+                            _note = (
+                                f'[IMPORTANT: The "{_display_name}" skill is auto-loaded. '
+                                f"Follow its instructions for this session.]"
+                            )
                         _part = _build_skill_message(_loaded_skill, _skill_dir, _note)
                         if _part:
                             _combined_parts.append(_part)
@@ -9008,6 +9094,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
+                if (
+                    _event_requires_google_sheet_write(event)
+                    and response
+                    and not _agent_messages_include_google_sheet_write(agent_messages)
+                ):
+                    response = _append_google_sheet_missing_notice(response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().

@@ -5496,6 +5496,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Make link-summary dispatch explicit for the downstream agent turn."""
         if decision.intent != "link_summary":
             return event
+        self._mark_link_summary_sheet_workflow(event)
         original = (event.text or "").strip()
         if original.startswith("[Telegram external link summary request]"):
             return event
@@ -5507,6 +5508,21 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         event.text = f"{guidance}{original}".strip()
         return event
+
+    @staticmethod
+    def _merge_auto_skill(existing: Any, skill_name: str) -> str | list[str]:
+        if not existing:
+            return skill_name
+        names = [existing] if isinstance(existing, str) else list(existing)
+        if skill_name not in names:
+            names.append(skill_name)
+        return names[0] if len(names) == 1 else names
+
+    def _mark_link_summary_sheet_workflow(self, event: MessageEvent) -> None:
+        """Persist workflow requirements across Telegram adapter -> gateway."""
+        event.auto_skill = self._merge_auto_skill(event.auto_skill, "google-workspace")
+        event.force_auto_skill_injection = True  # type: ignore[attr-defined]
+        event.telegram_link_summary_requires_sheet_write = True  # type: ignore[attr-defined]
 
     def _telegram_text_after_bot_trigger(self, message: Message) -> str:
         """Return text remaining after removing this bot's direct @mention."""

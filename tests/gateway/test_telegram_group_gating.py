@@ -179,6 +179,9 @@ def test_mentioned_youtube_link_is_enqueued_as_link_summary_workflow():
         event = captured[0]
         assert getattr(event, "telegram_interaction_intent", None) == "link_summary"
         assert getattr(event, "telegram_direct_bot_mention", None) is True
+        assert event.auto_skill == "google-workspace"
+        assert getattr(event, "force_auto_skill_injection", None) is True
+        assert getattr(event, "telegram_link_summary_requires_sheet_write", None) is True
         assert "Telegram external link summary request" in event.text
         assert "Fetch/read" in event.text
         assert "Google Sheet" in event.text

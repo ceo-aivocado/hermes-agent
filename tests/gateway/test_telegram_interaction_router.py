@@ -11,6 +11,7 @@ def _make_adapter(
     require_mention=True,
     allowed_chats=None,
     group_allowed_chats=None,
+    source_intake_chats=None,
     observe_unmentioned_group_messages=False,
     voice_user_ids=None,
 ):
@@ -20,6 +21,7 @@ def _make_adapter(
         "require_mention": require_mention,
         "allowed_chats": allowed_chats or [],
         "group_allowed_chats": group_allowed_chats or allowed_chats or [],
+        "source_intake_chats": source_intake_chats or [],
         "allowed_topics": [],
         "observe_unmentioned_group_messages": observe_unmentioned_group_messages,
     }
@@ -209,6 +211,22 @@ def test_router_classifies_external_link_summary_request():
 
 def test_router_dispatches_unmentioned_external_link_in_allowed_group():
     adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    msg = _group_text("https://example.com/article")
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "link_summary"
+    assert decision.reason == "external_link"
+
+
+def test_router_dispatches_unmentioned_external_link_in_source_intake_group_without_allowed_chats():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=[],
+        group_allowed_chats=["-100"],
+        source_intake_chats=["-100"],
+    )
     msg = _group_text("https://example.com/article")
 
     decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)

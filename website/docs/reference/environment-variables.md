@@ -245,6 +245,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `TELEGRAM_ALLOWED_USERS` | Comma-separated user IDs allowed to use the bot (applies to DMs, groups, and forums) |
 | `TELEGRAM_GROUP_ALLOWED_USERS` | Comma-separated sender user IDs authorized in groups/forums only (does NOT grant DM access). Chat-ID-shaped values (starting with `-`) are still honored as chat IDs for backward compat with pre-#17686 configs, with a deprecation warning. |
 | `TELEGRAM_GROUP_ALLOWED_CHATS` | Comma-separated group/forum chat IDs; any member is authorized |
+| `TELEGRAM_SOURCE_INTAKE_CHATS` | Comma-separated group/forum chat IDs where external links/videos/files are treated as source drops and dispatched for summarization without requiring an explicit bot mention |
 | `TELEGRAM_HOME_CHANNEL` | Default Telegram chat/channel for cron delivery |
 | `TELEGRAM_HOME_CHANNEL_NAME` | Display name for the Telegram home channel |
 | `TELEGRAM_CRON_THREAD_ID` | Forum topic ID to receive cron deliveries; overrides `TELEGRAM_HOME_CHANNEL_THREAD_ID` for cron only. Use in topic mode so replies to cron messages open a new session instead of hitting the system lobby (#24409). |

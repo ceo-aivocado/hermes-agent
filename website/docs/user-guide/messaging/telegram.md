@@ -962,6 +962,7 @@ Equivalent env vars:
 TELEGRAM_ALLOWED_USERS="123456789"
 TELEGRAM_GROUP_ALLOWED_USERS="987654321"
 TELEGRAM_GROUP_ALLOWED_CHATS="-1001234567890"
+TELEGRAM_SOURCE_INTAKE_CHATS="-1001234567890"
 ```
 
 Behavior:
@@ -969,6 +970,7 @@ Behavior:
 - `TELEGRAM_ALLOWED_USERS` covers all chat types (DMs, groups, forums).
 - `TELEGRAM_GROUP_ALLOWED_USERS` only authorizes the listed senders in groups/forums. They still can't DM the bot unless listed in `TELEGRAM_ALLOWED_USERS`.
 - A chat in `TELEGRAM_GROUP_ALLOWED_CHATS` authorizes every member of that chat, regardless of sender.
+- A chat in `TELEGRAM_SOURCE_INTAKE_CHATS` treats external links/videos/files as source drops and can dispatch summarization without an explicit bot mention.
 - Use `*` in any of these to allow any sender/chat.
 - This layers on top of existing mention/pattern triggers and on top of `group_topics` + `ignored_threads`.
 

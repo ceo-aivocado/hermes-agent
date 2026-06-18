@@ -145,6 +145,19 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATEWAY_BILLING_CREDITS_RE = re.compile(
+    r"("
+    r"billing\s+or\s+credits\s+exhausted"
+    r"|requires\s+more\s+credits"
+    r"|insufficient\s+credits"
+    r"|payment\s+required"
+    r"|can\s+only\s+afford"
+    r"|add\s+more\s+credits"
+    r"|\b402\b"
+    r")",
+    re.IGNORECASE,
+)
+
 _OWNER_ONLY_NOTICE_RE = re.compile(
     r"("
     r"credits?\s+\d+%\s+used"
@@ -341,8 +354,8 @@ def _gateway_provider_error_reply(text: str) -> str:
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
         return (
-            "⏱️ The model provider hit a billing, credit, or rate limit. "
-            "I kept raw provider details out of chat; check gateway logs."
+            "⏱️ The model provider could not complete this request right now. "
+            "I kept technical details out of chat; check owner diagnostics."
         )
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
@@ -385,6 +398,11 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
 def _is_owner_only_notice(text: str) -> bool:
     """Return True for operational notices that belong in owner/home chat only."""
     return bool(_OWNER_ONLY_NOTICE_RE.search(str(text or "")))
+
+
+def _looks_like_provider_billing_or_credits_error(text: str) -> bool:
+    """Return True for provider money/quota failures that must be owner-only."""
+    return bool(_GATEWAY_BILLING_CREDITS_RE.search(str(text or "")))
 
 
 def _credit_balance_from_usage_snapshot(snapshot: Any) -> Optional[float]:
@@ -2553,6 +2571,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
         self._credit_monitor_last_band_by_provider: Dict[str, Optional[str]] = {}
+        self._owner_provider_alert_last_sent: Dict[str, float] = {}
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -6806,6 +6825,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    async def _send_owner_provider_billing_alert(
+        self,
+        platform: Optional[Platform],
+        raw_text: str,
+    ) -> bool:
+        """Send provider billing/credits failures only to the owner home channel."""
+        if not _looks_like_provider_billing_or_credits_error(raw_text):
+            return False
+        key = "provider.billing_or_credits"
+        now = time.monotonic()
+        last_sent = self._owner_provider_alert_last_sent.get(key, 0.0)
+        if now - last_sent < 900.0:
+            return False
+
+        message = (
+            "⚠️ AiVocado provider credits alert: a model/tool provider refused "
+            "a request because balance, credits, or quota are low. Public chat "
+            "was sanitized. Check OpenRouter/Firecrawl credits."
+        )
+        if await self._deliver_home_channel_notice(platform, message):
+            self._owner_provider_alert_last_sent[key] = now
+            return True
+        return False
+
     def _credit_monitor_config(self) -> Optional[tuple[str, Platform, float, float, float]]:
         """Return the optional owner credit-monitor configuration."""
         provider = str(os.getenv("GATEWAY_CREDITS_MONITOR_PROVIDER", "") or "").strip().lower()
@@ -9364,6 +9407,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
+                if _looks_like_provider_billing_or_credits_error(response):
+                    await self._send_owner_provider_billing_alert(source.platform, response)
                 response = _sanitize_gateway_final_response(source.platform, response)
                 if (
                     _event_requires_google_sheet_write(event)
@@ -14581,6 +14626,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message,
             )
             if prepared_message is None:
+                if _looks_like_provider_billing_or_credits_error(message):
+                    safe_schedule_threadsafe(
+                        self._send_owner_provider_billing_alert(source.platform, message),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="owner provider billing alert scheduling error",
+                    )
                 logger.debug(
                     "status_callback suppressed for %s/%s: %s",
                     source.platform.value if source.platform else "unknown",

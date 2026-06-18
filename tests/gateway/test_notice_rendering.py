@@ -122,12 +122,7 @@ def _make_runner_with_adapter(source, adapter):
 
 
 class TestDeliverNoticeLine:
-    """The seam between render_notice_line and the platform adapter.
-
-    Proves a rendered credit-notice line reaches adapter.send (public) /
-    send_private_notice (private) through the shared _deliver_platform_notice
-    rail — the path the gateway notice_callback schedules onto the loop.
-    """
+    """The seam between render_notice_line and the platform adapter."""
 
     @pytest.mark.asyncio
     async def test_public_delivery_sends_rendered_line(self):
@@ -136,16 +131,14 @@ class TestDeliverNoticeLine:
         adapter.send = AsyncMock(return_value=MagicMock(success=True))
         runner = _make_runner_with_adapter(source, adapter)
 
-        line = render_notice_line(
-            AgentNotice(text="⚠ Credits 90% used · $20.00 cap", level="warn")
-        )
+        line = render_notice_line(AgentNotice(text="• Runtime notice ready", level="info"))
         await runner._deliver_platform_notice(source, line)
 
         adapter.send.assert_awaited_once()
         args, kwargs = adapter.send.call_args
         assert args[0] == "555"
         # Delivered verbatim — the policy's single glyph, not a doubled one.
-        assert args[1] == "⚠ Credits 90% used · $20.00 cap"
+        assert args[1] == "• Runtime notice ready"
 
     @pytest.mark.asyncio
     async def test_private_delivery_prefers_private_notice(self):
@@ -156,9 +149,7 @@ class TestDeliverNoticeLine:
         runner = _make_runner_with_adapter(source, adapter)
         runner.config.get_notice_delivery = MagicMock(return_value="private")
 
-        line = render_notice_line(
-            AgentNotice(text="✓ Credit access restored", level="success")
-        )
+        line = render_notice_line(AgentNotice(text="• Runtime notice ready", level="info"))
         await runner._deliver_platform_notice(source, line)
 
         adapter.send_private_notice.assert_awaited_once()
@@ -171,4 +162,3 @@ class TestDeliverNoticeLine:
         runner.adapters = {}
         # Must not raise when the platform has no registered adapter.
         await runner._deliver_platform_notice(source, "• anything")
-

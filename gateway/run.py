@@ -81,6 +81,11 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
+    r"|billing\s+or\s+credits\s+exhausted"
+    r"|requires\s+more\s+credits"
+    r"|insufficient\s+credits"
+    r"|payment\s+required"
+    r"|switching\s+to\s+fallback\s+provider"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     r")",
@@ -93,6 +98,10 @@ _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"|provider\s+authentication\s+failed"
     r"|non-retryable\s+error"
     r"|rate\s+limited\s+after\s+\d+\s+retries"
+    r"|billing\s+or\s+credits\s+exhausted"
+    r"|requires\s+more\s+credits"
+    r"|insufficient\s+credits"
+    r"|payment\s+required"
     r"|error\s+code\s*:"
     r"|\bhttp\s*\d{3}\b"
     r"|incorrect\s+api\s+key"
@@ -122,9 +131,45 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
 )
 
 _GATEWAY_RATE_LIMIT_RE = re.compile(
-    r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)",
+    r"("
+    r"rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit"
+    r"|billing\s+or\s+credits\s+exhausted"
+    r"|requires\s+more\s+credits"
+    r"|insufficient\s+credits"
+    r"|payment\s+required"
+    r"|can\s+only\s+afford"
+    r"|add\s+more\s+credits"
+    r"|max_tokens"
+    r"|\b402\b"
+    r")",
     re.IGNORECASE,
 )
+
+_OWNER_ONLY_NOTICE_RE = re.compile(
+    r"("
+    r"credits?\s+\d+%\s+used"
+    r"|credit\s+access\s+(?:paused|restored)"
+    r"|grant\s+spent"
+    r"|top-?up"
+    r"|billing\s+or\s+credits\s+exhausted"
+    r"|requires\s+more\s+credits"
+    r"|insufficient\s+credits"
+    r"|payment\s+required"
+    r")",
+    re.IGNORECASE,
+)
+
+_CREDIT_BALANCE_DETAIL_RE = re.compile(
+    r"\bcredits\s+balance:\s*\$([0-9][0-9,]*(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+
+_PROVIDER_DISPLAY_NAMES = {
+    "openrouter": "OpenRouter",
+    "nous": "Nous",
+    "anthropic": "Anthropic",
+    "openai-codex": "OpenAI Codex",
+}
 
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
@@ -295,12 +340,32 @@ def _gateway_provider_error_reply(text: str) -> str:
             "error out of chat; check gateway logs for details or try rephrasing."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+        return (
+            "⏱️ The model provider hit a billing, credit, or rate limit. "
+            "I kept raw provider details out of chat; check gateway logs."
+        )
     return (
         "⚠️ The model provider failed after retries. I kept raw provider details "
         "out of chat; check gateway logs for diagnostics."
     )
 
+
+_GATEWAY_PROVIDER_ERROR_STRONG_SHAPE_RE = re.compile(
+    r"^\s*(\W*\s*)?("
+    r"api\s+(?:call\s+)?failed"
+    r"|provider\s+authentication\s+failed"
+    r"|non-retryable\s+error"
+    r"|rate\s+limited\s+after\s+\d+\s+retries"
+    r"|billing\s+or\s+credits\s+exhausted"
+    r"|requires\s+more\s+credits"
+    r"|insufficient\s+credits"
+    r"|payment\s+required"
+    r"|error\s+code\s*:"
+    r"|incorrect\s+api\s+key"
+    r"|invalid\s+api\s+key"
+    r")",
+    re.IGNORECASE,
+)
 
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r"^\s*(\W*\s*)?("
@@ -315,6 +380,61 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _is_owner_only_notice(text: str) -> bool:
+    """Return True for operational notices that belong in owner/home chat only."""
+    return bool(_OWNER_ONLY_NOTICE_RE.search(str(text or "")))
+
+
+def _credit_balance_from_usage_snapshot(snapshot: Any) -> Optional[float]:
+    """Extract the rendered account-credit balance from an AccountUsageSnapshot."""
+    for detail in getattr(snapshot, "details", ()) or ():
+        match = _CREDIT_BALANCE_DETAIL_RE.search(str(detail or ""))
+        if not match:
+            continue
+        try:
+            return float(match.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _provider_display_name(provider: Any) -> str:
+    normalized = str(provider or "").strip().lower()
+    if not normalized:
+        return "Provider"
+    return _PROVIDER_DISPLAY_NAMES.get(
+        normalized,
+        normalized.replace("_", " ").replace("-", " ").title(),
+    )
+
+
+def _build_credit_monitor_notice(
+    snapshot: Any,
+    *,
+    low_usd: float,
+    critical_usd: float,
+) -> tuple[Optional[str], str]:
+    """Build a home-channel-only balance warning from an account usage snapshot."""
+    balance = _credit_balance_from_usage_snapshot(snapshot)
+    if balance is None:
+        return None, ""
+    if balance <= critical_usd:
+        band = "critical"
+        prefix = "⛔"
+    elif balance <= low_usd:
+        band = "low"
+        prefix = "⚠️"
+    else:
+        return None, ""
+
+    provider = _provider_display_name(getattr(snapshot, "provider", None))
+    message = (
+        f"{prefix} {provider} credits low: ${balance:.2f} left. "
+        "Top up soon so AiVocado can keep processing links and long tasks."
+    )
+    return band, message
 
 
 def _looks_like_gateway_provider_error(text: str) -> bool:
@@ -333,6 +453,8 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if not text:
         return False
     body = str(text).strip()
+    if _GATEWAY_PROVIDER_ERROR_STRONG_SHAPE_RE.search(body):
+        return True
     # Provider failure envelopes are short. Assistant answers that happen
     # to mention HTTP status codes ("HTTP 404 means...") tend to be longer.
     if len(body) > 400 or body.count("\n") > 4:
@@ -2430,6 +2552,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._credit_monitor_last_band_by_provider: Dict[str, Optional[str]] = {}
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -5428,6 +5551,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
+        # Start optional owner-only provider credit monitor. Disabled unless
+        # GATEWAY_CREDITS_MONITOR_PROVIDER is set.
+        asyncio.create_task(self._credits_monitor_watcher())
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -6635,8 +6762,152 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    async def _deliver_home_channel_notice(self, platform: Optional[Platform], content: str) -> bool:
+        """Deliver an owner-only operational notice to the configured home channel."""
+        if platform is None:
+            return False
+        adapter = self.adapters.get(platform)
+        if not adapter:
+            return False
+        config = getattr(self, "config", None)
+        if not config or not hasattr(config, "get_home_channel"):
+            return False
+        home = config.get_home_channel(platform)
+        home_chat_id = getattr(home, "chat_id", None)
+        if not isinstance(home_chat_id, (str, int)) or not str(home_chat_id).strip():
+            return False
+
+        try:
+            metadata = self._thread_metadata_for_target(
+                platform,
+                home_chat_id,
+                getattr(home, "thread_id", None),
+                adapter=adapter,
+            )
+        except Exception:
+            metadata = None
+
+        try:
+            result = await adapter.send(str(home_chat_id), content, metadata=metadata)
+        except Exception:
+            logger.debug(
+                "[%s] home-channel owner notice delivery failed",
+                getattr(platform, "value", platform),
+                exc_info=True,
+            )
+            return False
+
+        if result is not None and getattr(result, "success", True) is False:
+            logger.warning(
+                "[%s] home-channel owner notice was not delivered: %s",
+                getattr(platform, "value", platform),
+                getattr(result, "error", "send returned success=False"),
+            )
+            return False
+        return True
+
+    def _credit_monitor_config(self) -> Optional[tuple[str, Platform, float, float, float]]:
+        """Return the optional owner credit-monitor configuration."""
+        provider = str(os.getenv("GATEWAY_CREDITS_MONITOR_PROVIDER", "") or "").strip().lower()
+        if not provider or provider in {"0", "false", "off", "none"}:
+            return None
+
+        platform_raw = str(
+            os.getenv("GATEWAY_CREDITS_MONITOR_NOTIFY_PLATFORM", "telegram") or "telegram"
+        ).strip().lower()
+        try:
+            platform = Platform(platform_raw)
+        except Exception:
+            logger.warning(
+                "Ignoring credit monitor: invalid GATEWAY_CREDITS_MONITOR_NOTIFY_PLATFORM=%r",
+                platform_raw,
+            )
+            return None
+
+        def _float_env(name: str, default: float) -> float:
+            try:
+                return float(str(os.getenv(name, "") or "").strip() or default)
+            except (TypeError, ValueError):
+                logger.warning("Invalid %s=%r; using %.2f", name, os.getenv(name), default)
+                return default
+
+        interval = max(
+            300.0,
+            _float_env("GATEWAY_CREDITS_MONITOR_INTERVAL_SECONDS", 3600.0),
+        )
+        low_usd = max(0.0, _float_env("GATEWAY_CREDITS_MONITOR_LOW_USD", 10.0))
+        critical_usd = max(0.0, _float_env("GATEWAY_CREDITS_MONITOR_CRITICAL_USD", 3.0))
+        if critical_usd > low_usd:
+            critical_usd = low_usd
+        return provider, platform, interval, low_usd, critical_usd
+
+    async def _run_credit_monitor_once(
+        self,
+        provider: str,
+        platform: Platform,
+        *,
+        low_usd: float,
+        critical_usd: float,
+    ) -> None:
+        """Fetch provider usage and notify the owner home-channel on low balance."""
+        try:
+            snapshot = await asyncio.to_thread(fetch_account_usage, provider)
+        except Exception:
+            logger.debug("credit monitor fetch failed for %s", provider, exc_info=True)
+            return
+        if snapshot is None:
+            logger.debug("credit monitor: no usage snapshot for %s", provider)
+            return
+
+        band, message = _build_credit_monitor_notice(
+            snapshot,
+            low_usd=low_usd,
+            critical_usd=critical_usd,
+        )
+        key = str(provider or "").lower()
+        previous = self._credit_monitor_last_band_by_provider.get(key)
+        if band is None:
+            self._credit_monitor_last_band_by_provider[key] = None
+            return
+        if previous == band:
+            return
+        if await self._deliver_home_channel_notice(platform, message):
+            self._credit_monitor_last_band_by_provider[key] = band
+
+    async def _credits_monitor_watcher(self) -> None:
+        """Periodically warn the owner before provider credits run out."""
+        cfg = self._credit_monitor_config()
+        if cfg is None:
+            return
+        provider, platform, interval, low_usd, critical_usd = cfg
+        logger.info(
+            "Credit monitor enabled: provider=%s notify_platform=%s low_usd=%.2f critical_usd=%.2f interval=%.0fs",
+            provider,
+            platform.value,
+            low_usd,
+            critical_usd,
+            interval,
+        )
+        while self._running:
+            await self._run_credit_monitor_once(
+                provider,
+                platform,
+                low_usd=low_usd,
+                critical_usd=critical_usd,
+            )
+            await asyncio.sleep(interval)
+
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        if _is_owner_only_notice(content):
+            if await self._deliver_home_channel_notice(source.platform, content):
+                return
+            logger.warning(
+                "[%s] owner-only notice suppressed because no home-channel delivery was available",
+                getattr(source.platform, "value", source.platform),
+            )
+            return
+
         adapter = self.adapters.get(source.platform)
         if not adapter:
             return

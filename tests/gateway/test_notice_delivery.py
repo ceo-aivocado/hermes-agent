@@ -135,3 +135,34 @@ async def test_provider_billing_alert_routes_to_home_channel_not_source_group():
     assert "public chat was sanitized" in args[1].lower()
     assert "Error code" not in args[1]
     assert kwargs == {"metadata": {"thread_id": "777"}}
+
+
+def test_exec_approval_target_routes_telegram_group_to_home_channel():
+    runner, adapter = _make_telegram_runner()
+    source = _make_telegram_group_source()
+
+    chat_id, metadata = runner._exec_approval_delivery_target(
+        source,
+        fallback_chat_id=source.chat_id,
+        fallback_metadata={"thread_id": source.thread_id},
+        adapter=adapter,
+    )
+
+    assert chat_id == "10954083"
+    assert metadata == {"thread_id": "777"}
+
+
+def test_exec_approval_target_falls_back_to_source_without_home_channel():
+    runner, adapter = _make_telegram_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = None
+    source = _make_telegram_group_source()
+
+    chat_id, metadata = runner._exec_approval_delivery_target(
+        source,
+        fallback_chat_id=source.chat_id,
+        fallback_metadata={"thread_id": source.thread_id},
+        adapter=adapter,
+    )
+
+    assert chat_id == "-1003716216649"
+    assert metadata == {"thread_id": "644"}

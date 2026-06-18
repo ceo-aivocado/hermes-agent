@@ -5146,6 +5146,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_source_intake_chats(self) -> set[str]:
+        """Return Telegram chats where dropped sources should be processed."""
+        raw = self.config.extra.get("source_intake_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_SOURCE_INTAKE_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_observe_allowed_chats(self) -> set[str]:
         """Chats where observed group context may use a shared source.
 
@@ -5597,8 +5606,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+        source_intake = self._telegram_source_intake_chats()
+        if source_intake:
+            return chat_id_str in source_intake
         allowed = self._telegram_allowed_chats()
-        return bool(allowed and chat_id_str in allowed)
+        if allowed and chat_id_str in allowed:
+            return True
+        group_allowed = self._telegram_group_allowed_chats()
+        return bool(group_allowed and chat_id_str in group_allowed)
 
     def _telegram_interaction_decision(
         self,

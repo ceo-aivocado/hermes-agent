@@ -78,7 +78,10 @@ def test_telegram_final_response_sanitizes_billing_credit_errors():
     sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
 
     lowered = sanitized.lower()
-    assert "limit" in lowered or "rate-limiting" in lowered
+    assert "provider could not complete" in lowered
+    assert "billing" not in lowered
+    assert "credit" not in lowered
+    assert "limit" not in lowered
     assert "error code" not in lowered
     assert "openrouter.ai/settings/credits" not in lowered
     assert "65536" not in sanitized

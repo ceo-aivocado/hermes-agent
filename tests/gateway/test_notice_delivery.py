@@ -63,6 +63,7 @@ def _make_telegram_runner(extra=None):
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home-1"))
     adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._owner_provider_alert_last_sent = {}
     return runner, adapter
 
 
@@ -116,3 +117,21 @@ async def test_credit_notice_routes_to_telegram_home_channel_not_source_group():
         metadata={"thread_id": "777"},
     )
     adapter.send_private_notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_billing_alert_routes_to_home_channel_not_source_group():
+    runner, adapter = _make_telegram_runner()
+
+    await runner._send_owner_provider_billing_alert(
+        Platform.TELEGRAM,
+        "Billing or credits exhausted: Error code: 402 - This request requires more credits.",
+    )
+
+    adapter.send.assert_awaited_once()
+    args, kwargs = adapter.send.call_args
+    assert args[0] == "10954083"
+    assert "credits alert" in args[1].lower()
+    assert "public chat was sanitized" in args[1].lower()
+    assert "Error code" not in args[1]
+    assert kwargs == {"metadata": {"thread_id": "777"}}

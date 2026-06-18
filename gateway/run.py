@@ -6825,6 +6825,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    def _exec_approval_delivery_target(
+        self,
+        source,
+        *,
+        fallback_chat_id: str,
+        fallback_metadata: Optional[Dict[str, Any]],
+        adapter: Optional[Any] = None,
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Return the destination for dangerous-command approval prompts.
+
+        Telegram group chats are user-facing workspaces. Approval cards expose
+        raw commands and operational controls, so when a Telegram home channel
+        is configured we route the prompt there instead of leaking it into the
+        source group/topic. Other platforms keep the existing in-thread flow.
+        """
+        platform = getattr(source, "platform", None)
+        if platform == Platform.TELEGRAM:
+            config = getattr(self, "config", None)
+            home = config.get_home_channel(platform) if config and hasattr(config, "get_home_channel") else None
+            home_chat_id = getattr(home, "chat_id", None)
+            if isinstance(home_chat_id, (str, int)) and str(home_chat_id).strip():
+                chat_id = str(home_chat_id)
+                try:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        chat_id,
+                        getattr(home, "thread_id", None),
+                        adapter=adapter,
+                    )
+                except Exception:
+                    metadata = None
+                return chat_id, metadata
+
+        return str(fallback_chat_id), fallback_metadata
+
     async def _send_owner_provider_billing_alert(
         self,
         platform: Optional[Platform],
@@ -15143,6 +15178,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                approval_chat_id, approval_metadata = self._exec_approval_delivery_target(
+                    source,
+                    fallback_chat_id=_status_chat_id,
+                    fallback_metadata=_status_thread_metadata,
+                    adapter=_status_adapter,
+                )
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -15151,11 +15192,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         _approval_fut = safe_schedule_threadsafe(
                             _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
+                                chat_id=approval_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=approval_metadata,
                             ),
                             _loop_for_step,
                             logger=logger,
@@ -15191,9 +15232,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
                         _status_adapter.send(
-                            _status_chat_id,
+                            approval_chat_id,
                             msg,
-                            metadata=_status_thread_metadata,
+                            metadata=approval_metadata,
                         ),
                         _loop_for_step,
                         logger=logger,

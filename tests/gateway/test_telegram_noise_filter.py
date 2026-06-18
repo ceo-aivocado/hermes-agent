@@ -17,6 +17,8 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         "⏳ Retrying in 4.2s (attempt 1/3)...",
         "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
         "⚠️ Max retries (3) exhausted — trying fallback...",
+        "⚠️ Billing or credits exhausted — switching to fallback provider...",
+        "❌ Billing or credits exhausted — Error code: 402 - This request requires more credits.",
     ]
 
     for message in noisy_messages:
@@ -60,6 +62,27 @@ def test_telegram_final_response_sanitizes_raw_provider_errors():
     assert "cybersecurity risk" not in sanitized.lower()
     assert "HTTP 400" not in sanitized
     assert "req_abc" not in sanitized
+
+
+def test_telegram_final_response_sanitizes_billing_credit_errors():
+    """Billing/provider quota bodies should not leak into Telegram chats."""
+    raw = (
+        "Billing or credits exhausted: Error code: 402 - {'error': {'message': "
+        "'This request requires more credits, or fewer max_tokens. You requested "
+        "up to 65536 tokens, but can only afford 4627. To increase, visit "
+        "https://openrouter.ai/settings/credits and add more credits', 'code': 402, "
+        "'metadata': {'previous_errors': [{'code': 402, 'message': 'This request "
+        "requires more credits'}]}}}"
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
+
+    lowered = sanitized.lower()
+    assert "limit" in lowered or "rate-limiting" in lowered
+    assert "error code" not in lowered
+    assert "openrouter.ai/settings/credits" not in lowered
+    assert "65536" not in sanitized
+    assert "4627" not in sanitized
 
 
 def test_telegram_final_response_redacts_auth_secrets():

@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -18,6 +18,16 @@ def _make_source() -> SessionSource:
     )
 
 
+def _make_telegram_group_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1003716216649",
+        chat_type="group",
+        user_id="10954083",
+        thread_id="644",
+    )
+
+
 def _make_runner(extra=None):
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -29,6 +39,30 @@ def _make_runner(extra=None):
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="public-1"))
     adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
     runner.adapters = {Platform.SLACK: adapter}
+    return runner, adapter
+
+
+def _make_telegram_runner(extra=None):
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="10954083",
+                    name="Home",
+                    thread_id="777",
+                ),
+                extra=extra or {},
+            )
+        }
+    )
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home-1"))
+    adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
     return runner, adapter
 
 
@@ -64,4 +98,21 @@ async def test_deliver_platform_notice_uses_public_delivery_by_default():
     await runner._deliver_platform_notice(_make_source(), "hello")
 
     adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222"})
+    adapter.send_private_notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_credit_notice_routes_to_telegram_home_channel_not_source_group():
+    runner, adapter = _make_telegram_runner()
+
+    await runner._deliver_platform_notice(
+        _make_telegram_group_source(),
+        "✕ Credit access paused · run /credits to top up",
+    )
+
+    adapter.send.assert_awaited_once_with(
+        "10954083",
+        "✕ Credit access paused · run /credits to top up",
+        metadata={"thread_id": "777"},
+    )
     adapter.send_private_notice.assert_not_awaited()

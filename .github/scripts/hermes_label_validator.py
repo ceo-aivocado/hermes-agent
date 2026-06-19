@@ -31,7 +31,11 @@ def main() -> int:
     violations = validate_labels(labels)
 
     if not violations:
-        print(f"Hermes label validator passed for #{target['number']}: {', '.join(labels) or 'no labels'}")
+        body = success_comment(target["kind"], target["number"], labels)
+        print(body)
+        write_step_summary(body)
+        if args.post_comment:
+            post_or_update_comment(repo, target["number"], token, MARKER, body)
         return 0
 
     body = failure_comment(target["kind"], target["number"], labels, violations)
@@ -148,6 +152,19 @@ def failure_comment(kind: str, number: int, labels: list[str], violations: list[
     ]
     lines.extend(f"- {violation}" for violation in violations)
     return "\n".join(lines)
+
+
+def success_comment(kind: str, number: int, labels: list[str]) -> str:
+    return "\n".join(
+        [
+            "## Hermes Label Validator passed",
+            "",
+            f"{kind} `#{number}` satisfies the Hermes orchestration label rules.",
+            "",
+            "Current labels:",
+            display(labels),
+        ]
+    )
 
 
 def write_step_summary(body: str) -> None:

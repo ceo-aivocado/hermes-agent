@@ -31,13 +31,24 @@ def main() -> int:
     head_sha = pr["head_sha"]
 
     if not roadmap_changed(base_sha, head_sha):
-        print(f"ROADMAP.md is unchanged in PR #{pr['number']}; consistency gate passed.")
+        body = success_comment(pr["number"], "ROADMAP.md is unchanged in this PR.")
+        print(body)
+        write_step_summary(body)
+        if args.post_comment:
+            post_or_update_comment(repo, pr["number"], token, MARKER, body)
         return 0
 
     commits = roadmap_commits(base_sha, head_sha)
     bad_commits = [(sha, subject) for sha, subject in commits if not ROADMAP_COMMIT_RE.match(subject)]
     if not bad_commits:
-        print(f"ROADMAP.md changes in PR #{pr['number']} use chore(roadmap): commits.")
+        body = success_comment(
+            pr["number"],
+            "ROADMAP.md changes use keeper-style `chore(roadmap): ...` commits.",
+        )
+        print(body)
+        write_step_summary(body)
+        if args.post_comment:
+            post_or_update_comment(repo, pr["number"], token, MARKER, body)
         return 0
 
     body = failure_comment(pr["number"], bad_commits)
@@ -151,6 +162,18 @@ def failure_comment(pr_number: int, bad_commits: list[tuple[str, str]]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def success_comment(pr_number: int, detail: str) -> str:
+    return "\n".join(
+        [
+            "## Hermes Roadmap Consistency passed",
+            "",
+            f"PR `#{pr_number}` satisfies the Hermes ROADMAP consistency rules.",
+            "",
+            detail,
+        ]
+    )
 
 
 def write_step_summary(body: str) -> None:

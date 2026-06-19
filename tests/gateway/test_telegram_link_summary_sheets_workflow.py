@@ -10,6 +10,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from gateway.source_ledger import (
+    pending_source_replay_records,
     recover_source_intake_pending,
     record_link_summary_result,
     record_link_summary_sources,
@@ -298,9 +299,70 @@ async def test_link_summary_does_not_warn_when_sheet_append_tool_call_exists(mon
     )
 
     assert response == "Конспект готов и строка добавлена."
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "summary_created"
+    assert ledger_rows[-1]["sheet_status"] == "succeeded"
+    assert ledger_rows[-1]["done"] is True
+
     outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
-    assert outbox_rows[-1]["event"] == "sheet_write_attempted"
-    assert outbox_rows[-1]["status"] == "attempted"
+    assert outbox_rows[-1]["event"] == "sheet_write_succeeded"
+    assert outbox_rows[-1]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_link_summary_keeps_sheet_failed_pending(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Конспект готов.",
+            "messages": [
+                {"role": "user", "content": "summarize url"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_sheet",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": (
+                                    '{"cmd":"python skills/productivity/google-workspace/scripts/'
+                                    'google_api.py sheets append SHEET_ID Sheet1!A:C --values '
+                                    '\\"[[\\\\\\"url\\\\\\",\\\\\\"summary\\\\\\"]]\\\""}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_sheet", "content": '{"error":"NOT_AUTHENTICATED"}'},
+                {"role": "assistant", "content": "Конспект готов."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _link_summary_event(),
+        _link_summary_event().source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response is not None
+    assert "База: запись в Google Sheet не подтверждена" in response
+
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "summary_created"
+    assert ledger_rows[-1]["sheet_status"] == "failed"
+    assert ledger_rows[-1]["done"] is False
+
+    outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
+    assert outbox_rows[-1]["event"] == "sheet_write_failed"
+    assert outbox_rows[-1]["status"] == "pending"
+
+    pending = pending_source_replay_records(tmp_path)
+    assert [row["source_id"] for row in pending] == [ledger_rows[-1]["source_id"]]
 
 
 @pytest.mark.asyncio
@@ -345,7 +407,14 @@ async def test_source_replay_retries_pending_sheet_write_quietly(monkeypatch, tm
 
     summary = await runner._replay_source_intake_pending(limit=5)
 
-    assert summary == {"queued": 1, "attempted": 1, "sheet_write_attempted": 1, "failed": 0}
+    assert summary == {
+        "queued": 1,
+        "attempted": 1,
+        "sheet_write_attempted": 1,
+        "sheet_write_succeeded": 1,
+        "sheet_write_failed": 0,
+        "failed": 0,
+    }
     kwargs = runner._run_agent.await_args.kwargs
     assert kwargs["history"] == []
     assert kwargs["silent"] is True
@@ -356,8 +425,29 @@ async def test_source_replay_retries_pending_sheet_write_quietly(monkeypatch, tm
     ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
     assert ledger_rows[-1]["event"] == "source_replay_completed"
     assert ledger_rows[-1]["source_id"] == records[0]["source_id"]
-    assert ledger_rows[-1]["sheet_status"] == "write_attempted"
+    assert ledger_rows[-1]["sheet_status"] == "succeeded"
+    assert ledger_rows[-1]["done"] is True
 
     outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
-    assert outbox_rows[-1]["event"] == "sheet_write_attempted"
-    assert outbox_rows[-1]["status"] == "attempted"
+    assert outbox_rows[-1]["event"] == "sheet_write_succeeded"
+    assert outbox_rows[-1]["status"] == "succeeded"
+
+
+def test_source_replay_periodic_sweep_respects_interval(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    calls = []
+    runner._schedule_source_intake_replay = lambda: calls.append("scheduled") or 2
+    monkeypatch.setenv("HERMES_SOURCE_REPLAY_SWEEP_INTERVAL_SECONDS", "60")
+
+    assert runner._maybe_schedule_source_intake_replay_sweep(now=1000.0) == 2
+    assert runner._maybe_schedule_source_intake_replay_sweep(now=1030.0) == 0
+    assert runner._maybe_schedule_source_intake_replay_sweep(now=1061.0) == 2
+    assert calls == ["scheduled", "scheduled"]
+
+
+def test_source_replay_periodic_sweep_can_be_disabled(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    runner._schedule_source_intake_replay = lambda: 1
+    monkeypatch.setenv("HERMES_SOURCE_REPLAY_SWEEP_INTERVAL_SECONDS", "0")
+
+    assert runner._maybe_schedule_source_intake_replay_sweep(now=1000.0) == 0

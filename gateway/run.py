@@ -576,6 +576,24 @@ _GOOGLE_SHEET_VISIBLE_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_GOOGLE_SHEET_SUCCESS_STATUSES = frozenset({
+    "ok",
+    "success",
+    "succeeded",
+    "updated",
+    "appended",
+    "created",
+})
+
+_GOOGLE_SHEET_FAILURE_STATUSES = frozenset({
+    "error",
+    "failed",
+    "failure",
+    "not_authenticated",
+    "unauthorized",
+    "forbidden",
+})
+
 
 def _stringify_for_gateway_audit(value: Any) -> str:
     if value is None:
@@ -588,35 +606,131 @@ def _stringify_for_gateway_audit(value: Any) -> str:
         return str(value)
 
 
-def _agent_messages_include_google_sheet_write(messages: Any) -> bool:
-    """Return True when the agent actually attempted a Google Sheets write."""
-    if not isinstance(messages, list):
+def _google_sheet_tool_call_matches(call: Any) -> bool:
+    if not isinstance(call, dict):
         return False
+    function = call.get("function")
+    if isinstance(function, dict):
+        name = _stringify_for_gateway_audit(function.get("name"))
+        args = _stringify_for_gateway_audit(function.get("arguments"))
+        if _GOOGLE_SHEET_WRITE_NAME_RE.search(name):
+            return True
+        if _GOOGLE_SHEET_WRITE_ARGS_RE.search(args):
+            return True
+    name = _stringify_for_gateway_audit(call.get("name"))
+    args = " ".join(
+        _stringify_for_gateway_audit(call.get(key))
+        for key in ("arguments", "input", "args")
+    )
+    if _GOOGLE_SHEET_WRITE_NAME_RE.search(name):
+        return True
+    return bool(_GOOGLE_SHEET_WRITE_ARGS_RE.search(args))
 
+
+def _google_sheet_result_has_success(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_l = str(key).lower()
+            if key_l == "updatedcells":
+                try:
+                    if int(item) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+            if key_l in {"updatedrange", "spreadsheeturl"} and str(item or "").strip():
+                return True
+            if key_l in {"status", "result"} and str(item or "").strip().lower() in _GOOGLE_SHEET_SUCCESS_STATUSES:
+                return True
+            if key_l == "success" and item is True:
+                return True
+            if _google_sheet_result_has_success(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_google_sheet_result_has_success(item) for item in value)
+    return False
+
+
+def _google_sheet_result_has_failure(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_l = str(key).lower()
+            if key_l in {"error", "errors", "exception", "traceback"} and item:
+                return True
+            if key_l in {"status", "result"} and str(item or "").strip().lower() in _GOOGLE_SHEET_FAILURE_STATUSES:
+                return True
+            if _google_sheet_result_has_failure(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_google_sheet_result_has_failure(item) for item in value)
+    return False
+
+
+def _google_sheet_tool_result_status(content: Any) -> str:
+    text = _stringify_for_gateway_audit(content).strip()
+    if not text:
+        return "attempted"
+    parsed: Any = None
+    parsed_ok = False
+    try:
+        parsed = json.loads(text)
+        parsed_ok = True
+    except Exception:
+        parsed_ok = False
+    if parsed_ok:
+        if _google_sheet_result_has_failure(parsed):
+            return "failed"
+        if _google_sheet_result_has_success(parsed):
+            return "succeeded"
+    text_l = text.lower()
+    if any(marker in text_l for marker in ("not_authenticated", "unauthorized", "forbidden", "traceback", "exception")):
+        return "failed"
+    if re.search(r"\berror\b|\bfailed\b|\bfailure\b", text_l):
+        return "failed"
+    if re.search(r"\b(updatedcells|updatedrange|status[\"']?\s*:\s*[\"']?ok)\b", text_l):
+        return "succeeded"
+    return "attempted"
+
+
+def _agent_messages_google_sheet_write_status(messages: Any) -> str:
+    """Return none/attempted/succeeded/failed for Google Sheets writes."""
+    if not isinstance(messages, list):
+        return "none"
+
+    sheet_call_ids: set[str] = set()
+    attempted = False
+    last_result_status = ""
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         for call in msg.get("tool_calls") or []:
-            if not isinstance(call, dict):
+            if not _google_sheet_tool_call_matches(call):
                 continue
-            function = call.get("function")
-            if isinstance(function, dict):
-                name = _stringify_for_gateway_audit(function.get("name"))
-                args = _stringify_for_gateway_audit(function.get("arguments"))
-                if _GOOGLE_SHEET_WRITE_NAME_RE.search(name):
-                    return True
-                if _GOOGLE_SHEET_WRITE_ARGS_RE.search(args):
-                    return True
-            name = _stringify_for_gateway_audit(call.get("name"))
-            args = " ".join(
-                _stringify_for_gateway_audit(call.get(key))
-                for key in ("arguments", "input", "args")
-            )
-            if _GOOGLE_SHEET_WRITE_NAME_RE.search(name):
-                return True
-            if _GOOGLE_SHEET_WRITE_ARGS_RE.search(args):
-                return True
-    return False
+            attempted = True
+            call_id = str(call.get("id") or "")
+            if call_id:
+                sheet_call_ids.add(call_id)
+
+        if msg.get("role") != "tool":
+            continue
+        tool_call_id = str(msg.get("tool_call_id") or "")
+        if sheet_call_ids and tool_call_id not in sheet_call_ids:
+            continue
+        if not sheet_call_ids and not attempted:
+            continue
+        result_status = _google_sheet_tool_result_status(msg.get("content"))
+        if result_status in {"succeeded", "failed"}:
+            last_result_status = result_status
+
+    if last_result_status:
+        return last_result_status
+    return "attempted" if attempted else "none"
+
+
+def _agent_messages_include_google_sheet_write(messages: Any) -> bool:
+    """Return True when the agent actually attempted a Google Sheets write."""
+    return _agent_messages_google_sheet_write_status(messages) != "none"
 
 
 def _event_requires_google_sheet_write(event: Any) -> bool:
@@ -5173,6 +5287,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "queued": len(records),
             "attempted": 0,
             "sheet_write_attempted": 0,
+            "sheet_write_succeeded": 0,
+            "sheet_write_failed": 0,
             "failed": 0,
         }
         for record in records:
@@ -5211,21 +5327,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = str(agent_result.get("final_response") or "")
                 agent_messages = agent_result.get("messages", [])
-                sheet_write_attempted = _agent_messages_include_google_sheet_write(agent_messages)
+                sheet_write_status = _agent_messages_google_sheet_write_status(agent_messages)
+                sheet_write_attempted = sheet_write_status != "none"
+                sheet_write_succeeded = sheet_write_status == "succeeded"
+                sheet_write_failed = sheet_write_status == "failed"
                 record_link_summary_result(
                     _hermes_home,
                     event,
                     response_text=response,
                     sheet_write_attempted=sheet_write_attempted,
+                    sheet_write_succeeded=sheet_write_succeeded,
+                    sheet_write_failed=sheet_write_failed,
                 )
                 record_source_replay_result(
                     _hermes_home,
                     record,
                     response_text=response,
                     sheet_write_attempted=sheet_write_attempted,
+                    sheet_write_succeeded=sheet_write_succeeded,
+                    sheet_write_failed=sheet_write_failed,
                 )
                 if sheet_write_attempted:
                     summary["sheet_write_attempted"] += 1
+                if sheet_write_succeeded:
+                    summary["sheet_write_succeeded"] += 1
+                if sheet_write_failed:
+                    summary["sheet_write_failed"] += 1
             except Exception as exc:
                 summary["failed"] += 1
                 logger.warning("Source replay failed for %s: %s", source_id or "unknown", exc)
@@ -5238,10 +5365,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._clear_session_env(tokens)
         if summary["attempted"]:
             logger.info(
-                "Source intake replay: queued=%d attempted=%d sheet_write_attempted=%d failed=%d",
+                "Source intake replay: queued=%d attempted=%d sheet_write_attempted=%d "
+                "sheet_write_succeeded=%d sheet_write_failed=%d failed=%d",
                 summary["queued"],
                 summary["attempted"],
                 summary["sheet_write_attempted"],
+                summary["sheet_write_succeeded"],
+                summary["sheet_write_failed"],
                 summary["failed"],
             )
         return summary
@@ -5253,6 +5383,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return max(0, int(raw))
         except (TypeError, ValueError):
             return 3
+
+    @staticmethod
+    def _source_replay_sweep_interval_seconds() -> float:
+        raw = os.getenv("HERMES_SOURCE_REPLAY_SWEEP_INTERVAL_SECONDS", "900")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 900.0
 
     def _schedule_source_intake_replay(self) -> int:
         limit = self._source_replay_startup_limit()
@@ -5272,6 +5410,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.add_done_callback(self._background_tasks.discard)
         logger.info("Scheduled source intake replay for %d pending source(s)", len(pending))
         return len(pending)
+
+    def _maybe_schedule_source_intake_replay_sweep(self, *, now: float | None = None) -> int:
+        interval = self._source_replay_sweep_interval_seconds()
+        if interval <= 0:
+            return 0
+        now_ts = time.time() if now is None else float(now)
+        last_ts = float(getattr(self, "_last_source_replay_sweep_ts", 0.0) or 0.0)
+        if last_ts and now_ts - last_ts < interval:
+            return 0
+        self._last_source_replay_sweep_ts = now_ts
+        return self._schedule_source_intake_replay()
 
     async def start(self) -> bool:
         """
@@ -5784,6 +5933,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
         self._schedule_source_intake_replay()
+        self._last_source_replay_sweep_ts = time.time()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -6205,6 +6355,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as _e:
                     logger.debug("Idle agent sweep failed: %s", _e)
+
+                try:
+                    _source_replay_scheduled = self._maybe_schedule_source_intake_replay_sweep()
+                    if _source_replay_scheduled:
+                        logger.info(
+                            "Source intake replay sweep: scheduled %d pending source(s)",
+                            _source_replay_scheduled,
+                        )
+                except Exception as _e:
+                    logger.debug("Source intake replay sweep failed: %s", _e)
 
                 # Periodically prune stale SessionStore entries.  The
                 # in-memory dict (and sessions.json) would otherwise grow
@@ -9743,7 +9903,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._send_owner_provider_billing_alert(source.platform, response)
                 response = _sanitize_gateway_final_response(source.platform, response)
                 if _event_requires_google_sheet_write(event):
-                    _sheet_write_attempted = _agent_messages_include_google_sheet_write(agent_messages)
+                    _sheet_write_status = _agent_messages_google_sheet_write_status(agent_messages)
+                    _sheet_write_attempted = _sheet_write_status != "none"
+                    _sheet_write_succeeded = _sheet_write_status == "succeeded"
+                    _sheet_write_failed = _sheet_write_status == "failed"
                     try:
                         from gateway.source_ledger import record_link_summary_result
 
@@ -9752,10 +9915,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event,
                             response_text=response,
                             sheet_write_attempted=_sheet_write_attempted,
+                            sheet_write_succeeded=_sheet_write_succeeded,
+                            sheet_write_failed=_sheet_write_failed,
                         )
                     except Exception as _ledger_err:
                         logger.warning("Failed to record Telegram source ledger result: %s", _ledger_err)
-                    if response and not _sheet_write_attempted:
+                    if response and not _sheet_write_succeeded:
                         response = _append_google_sheet_missing_notice(response)
 
             # Ordering contract: the agent thread already updated the contextvar

@@ -180,6 +180,63 @@ def test_record_link_summary_result_marks_sheet_attempt_without_done(tmp_path):
     assert outbox_rows[-1]["status"] == "attempted"
 
 
+def test_record_link_summary_result_marks_sheet_success_done(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов и строка добавлена.",
+        sheet_write_attempted=True,
+        sheet_write_succeeded=True,
+    )
+
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    result_row = ledger_rows[-1]
+    assert result_row["event"] == "summary_created"
+    assert result_row["source_id"] == records[0]["source_id"]
+    assert result_row["status"] == "summary_created"
+    assert result_row["sheet_status"] == "succeeded"
+    assert result_row["done"] is True
+
+    outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
+    assert outbox_rows[-1]["event"] == "sheet_write_succeeded"
+    assert outbox_rows[-1]["source_id"] == records[0]["source_id"]
+    assert outbox_rows[-1]["status"] == "succeeded"
+
+
+def test_record_link_summary_result_marks_sheet_failed_pending(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов, но таблица не записалась.",
+        sheet_write_attempted=True,
+        sheet_write_failed=True,
+    )
+
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    result_row = ledger_rows[-1]
+    assert result_row["event"] == "summary_created"
+    assert result_row["source_id"] == records[0]["source_id"]
+    assert result_row["status"] == "published_without_save"
+    assert result_row["sheet_status"] == "failed"
+    assert result_row["done"] is False
+
+    outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
+    assert outbox_rows[-1]["event"] == "sheet_write_failed"
+    assert outbox_rows[-1]["source_id"] == records[0]["source_id"]
+    assert outbox_rows[-1]["status"] == "pending"
+
+    pending = pending_source_replay_records(tmp_path)
+    assert [row["source_id"] for row in pending] == [records[0]["source_id"]]
+
+
 def test_recover_source_intake_repairs_missing_outbox_after_restart(tmp_path):
     event = _link_summary_event("https://example.com/source")
     records = record_link_summary_sources(tmp_path, event)

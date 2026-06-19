@@ -7655,8 +7655,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         key = "provider.billing_or_credits"
         now = time.monotonic()
-        last_sent = self._owner_provider_alert_last_sent.get(key, 0.0)
-        if now - last_sent < 900.0:
+        last_sent = self._owner_provider_alert_last_sent.get(key)
+        if last_sent is not None and now - last_sent < 900.0:
             return False
 
         message = (

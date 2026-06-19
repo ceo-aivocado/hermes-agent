@@ -1,0 +1,66 @@
+name: Label Validator
+
+on:
+  issues:
+    types: [opened, edited, labeled, unlabeled]
+  pull_request:
+    branches: [main]
+    types: [opened, edited, labeled, unlabeled, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      target_number:
+        description: "Issue or PR number to validate"
+        required: true
+      target_type:
+        description: "Target type"
+        required: true
+        type: choice
+        options: [issue, pull_request]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: label-validator-${{ github.event.issue.number || github.event.pull_request.number || inputs.target_number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check OPENAI_API_KEY secret
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error title=Missing OPENAI_API_KEY::Add OPENAI_API_KEY in repository Actions secrets before enabling Hermes Codex gates."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Run Codex label review
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            Run the Hermes label-check review for this issue/PR event.
+            Use the repository label invariants:
+            - exactly one lane:* label
+            - exactly one type:* label
+            - exactly one status:* label
+            - at most one risk:* label
+            Do not edit files or post comments; the next deterministic CI step posts the failure comment and fails the check.
+          sandbox: workspace-write
+          output-file: .codex-label-validator.md
+
+      - name: Validate label invariants
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HERMES_TARGET_NUMBER: ${{ inputs.target_number }}
+        run: python3 .github/scripts/hermes_label_validator.py

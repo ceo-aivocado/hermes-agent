@@ -28,4 +28,10 @@ fi
 
 command -v curl >/dev/null 2>&1 || sudo apt-get install -y curl
 
+if command -v uv >/dev/null 2>&1; then
+  uv add --dev pytest
+else
+  echo "uv not found; skipping pytest dev install."
+fi
+
 echo "Hermes Bot setup complete."

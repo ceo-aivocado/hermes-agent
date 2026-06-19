@@ -101,7 +101,7 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
-def _existing_source_ids(path: Path) -> set[str]:
+def _existing_source_ids(path: Path, *, event_name: str = "source_discovered") -> set[str]:
     if not path.exists():
         return set()
     existing: set[str] = set()
@@ -113,7 +113,7 @@ def _existing_source_ids(path: Path) -> set[str]:
         except json.JSONDecodeError:
             continue
         source_id = str(row.get("source_id") or "")
-        if source_id and row.get("event") == "source_discovered":
+        if source_id and row.get("event") == event_name:
             existing.add(source_id)
     return existing
 
@@ -132,9 +132,13 @@ def record_link_summary_sources(hermes_home: Path, event: Any) -> list[dict[str,
     urls, source_message_id, trigger_message_id = _source_urls_and_message_ids(event)
     created_at = _now_iso()
     intake_dir = source_intake_dir(hermes_home)
-    existing = _existing_source_ids(intake_dir / "source_ledger.jsonl")
+    ledger_path = intake_dir / "source_ledger.jsonl"
+    outbox_path = intake_dir / "sheet_outbox.jsonl"
+    existing = _existing_source_ids(ledger_path)
+    existing_outbox = _existing_source_ids(outbox_path, event_name="sheet_write_required")
     records: list[dict[str, Any]] = []
     new_records: list[dict[str, Any]] = []
+    new_outbox_records: list[dict[str, Any]] = []
     for url in urls:
         record = {
             **_base_record(
@@ -151,13 +155,15 @@ def record_link_summary_sources(hermes_home: Path, event: Any) -> list[dict[str,
         records.append(record)
         if record["source_id"] not in existing:
             new_records.append(record)
+        if record["source_id"] not in existing_outbox:
+            new_outbox_records.append(record)
 
     setattr(event, "telegram_source_ledger_records", records)
     setattr(event, "telegram_source_ledger_ids", [record["source_id"] for record in records])
 
-    _append_jsonl(intake_dir / "source_ledger.jsonl", new_records)
+    _append_jsonl(ledger_path, new_records)
     _append_jsonl(
-        intake_dir / "sheet_outbox.jsonl",
+        outbox_path,
         [
             {
                 "event": "sheet_write_required",
@@ -166,7 +172,7 @@ def record_link_summary_sources(hermes_home: Path, event: Any) -> list[dict[str,
                 "url_or_ref": record["url_or_ref"],
                 "created_at": created_at,
             }
-            for record in new_records
+            for record in new_outbox_records
         ],
     )
     return records

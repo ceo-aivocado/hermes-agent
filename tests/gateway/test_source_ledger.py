@@ -86,6 +86,26 @@ def test_record_link_summary_sources_is_idempotent_for_duplicate_source(tmp_path
     assert [row["event"] for row in outbox_rows] == ["sheet_write_required"]
 
 
+def test_record_link_summary_sources_repairs_missing_outbox_for_existing_source(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+
+    first = record_link_summary_sources(tmp_path, event)
+    intake_dir = source_intake_dir(tmp_path)
+    outbox_path = intake_dir / "sheet_outbox.jsonl"
+    outbox_path.unlink()
+
+    second = record_link_summary_sources(tmp_path, event)
+
+    assert first[0]["source_id"] == second[0]["source_id"]
+
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    assert [row["event"] for row in ledger_rows] == ["source_discovered"]
+
+    outbox_rows = _read_jsonl(outbox_path)
+    assert [row["event"] for row in outbox_rows] == ["sheet_write_required"]
+    assert outbox_rows[0]["source_id"] == first[0]["source_id"]
+
+
 def test_reply_to_source_uses_replied_message_as_source_identity(tmp_path):
     original = _link_summary_event("https://example.com/source")
     original.message_id = "source-7"

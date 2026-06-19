@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -81,6 +82,11 @@ def _link_summary_event() -> MessageEvent:
     return event
 
 
+def _read_source_intake_jsonl(tmp_path, filename):
+    path = Path(tmp_path) / "source_intake" / filename
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 @pytest.mark.asyncio
 async def test_link_summary_forces_google_workspace_skill_in_existing_session(monkeypatch, tmp_path):
     runner = _bootstrap_runner(monkeypatch, tmp_path)
@@ -88,7 +94,7 @@ async def test_link_summary_forces_google_workspace_skill_in_existing_session(mo
     skill_dir = Path(tmp_path) / "skills" / "productivity" / "google-workspace"
     monkeypatch.setattr(
         "agent.skill_commands._load_skill_payload",
-        lambda name, task_id=None: ("skill body", skill_dir, "Google Workspace")
+        lambda name, task_id=None: ("skill body https://docs.example/skill", skill_dir, "Google Workspace")
         if name == "google-workspace"
         else None,
     )
@@ -118,6 +124,55 @@ async def test_link_summary_forces_google_workspace_skill_in_existing_session(mo
     assert "[SKILL:google-workspace]" in message
     assert "Google Workspace" in message
     assert "https://www.youtube.com/watch?v=8HjIfT2HYII4" in message
+
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    discovered_urls = [row["url_or_ref"] for row in ledger_rows if row["event"] == "source_discovered"]
+    assert discovered_urls == ["https://www.youtube.com/watch?v=8HjIfT2HYII4"]
+
+
+@pytest.mark.asyncio
+async def test_link_summary_records_source_before_agent_run(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+
+    async def _run_agent_with_ledger_assertion(**_kwargs):
+        ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+        assert ledger_rows[0]["event"] == "source_discovered"
+        assert ledger_rows[0]["url_or_ref"] == "https://www.youtube.com/watch?v=8HjIfT2HYII4"
+        assert ledger_rows[0]["status"] == "queued"
+        assert ledger_rows[0]["sheet_status"] == "pending"
+        assert ledger_rows[0]["done"] is False
+        return {
+            "final_response": "Конспект готов.",
+            "messages": [{"role": "assistant", "content": "Конспект готов."}],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+
+    runner._run_agent = AsyncMock(side_effect=_run_agent_with_ledger_assertion)
+
+    response = await runner._handle_message_with_agent(
+        _link_summary_event(),
+        _link_summary_event().source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response is not None
+    assert "База: запись в Google Sheet не подтверждена" in response
+
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    assert [row["event"] for row in ledger_rows] == ["source_discovered", "summary_created"]
+    assert ledger_rows[-1]["status"] == "published_without_save"
+    assert ledger_rows[-1]["sheet_status"] == "pending"
+    assert ledger_rows[-1]["done"] is False
+
+    outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
+    assert [row["event"] for row in outbox_rows] == [
+        "sheet_write_required",
+        "sheet_write_missing",
+    ]
+    assert outbox_rows[-1]["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -238,3 +293,6 @@ async def test_link_summary_does_not_warn_when_sheet_append_tool_call_exists(mon
     )
 
     assert response == "Конспект готов и строка добавлена."
+    outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
+    assert outbox_rows[-1]["event"] == "sheet_write_attempted"
+    assert outbox_rows[-1]["status"] == "attempted"

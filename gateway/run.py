@@ -8955,6 +8955,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
 
+        if _event_requires_google_sheet_write(event):
+            from gateway.source_ledger import record_link_summary_sources
+
+            record_link_summary_sources(_hermes_home, event)
+
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
         # Normally only inject on NEW sessions — ongoing conversations already
@@ -9533,12 +9538,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _looks_like_provider_billing_or_credits_error(response):
                     await self._send_owner_provider_billing_alert(source.platform, response)
                 response = _sanitize_gateway_final_response(source.platform, response)
-                if (
-                    _event_requires_google_sheet_write(event)
-                    and response
-                    and not _agent_messages_include_google_sheet_write(agent_messages)
-                ):
-                    response = _append_google_sheet_missing_notice(response)
+                if _event_requires_google_sheet_write(event):
+                    _sheet_write_attempted = _agent_messages_include_google_sheet_write(agent_messages)
+                    try:
+                        from gateway.source_ledger import record_link_summary_result
+
+                        record_link_summary_result(
+                            _hermes_home,
+                            event,
+                            response_text=response,
+                            sheet_write_attempted=_sheet_write_attempted,
+                        )
+                    except Exception as _ledger_err:
+                        logger.warning("Failed to record Telegram source ledger result: %s", _ledger_err)
+                    if response and not _sheet_write_attempted:
+                        response = _append_google_sheet_missing_notice(response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().

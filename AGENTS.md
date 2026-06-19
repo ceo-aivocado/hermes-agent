@@ -1,3 +1,121 @@
+# AGENTS.md - Hermes Bot Orchestration Layer
+
+Codex reads this file automatically before every task. Treat this top section as the durable orchestration rules for the AiVocado Telegram-facing Hermes Bot work. The existing Hermes Agent development guide below still applies for code quality, architecture, and contribution standards.
+
+## Project Context
+
+Hermes Bot is the Telegram-facing AiVocado assistant for АЮ, built on the `ceo-aivocado/hermes-agent` runtime. The orchestration goal is a six-role Codex system that can triage, research, specify, implement, QA, and report work with minimal owner interruption.
+
+**Production:** `root@167.233.53.205`. Runtime path `/usr/local/lib/hermes-agent`. Gateway/service label `hermes-gateway`.
+
+Important production nuance: the live gateway may be supervised as `/usr/local/lib/hermes-agent/venv/bin/python -m hermes_cli.main gateway run`, and may not have a `hermes-gateway.service` systemd unit. Before any restart, verify the actual process model with `pgrep -af 'hermes_cli.main gateway run'` and only use `systemctl` after confirming the unit exists.
+
+**Source of truth:**
+- Plan and status: `ROADMAP.md` (auto-maintained by MAIN; do not hand-edit outside the roadmap keeper workflow).
+- Code: this repo, branch `main`.
+- Issues and PRs: GitHub.
+
+## Six Agent Roles
+
+| Chat | Role | Domain |
+|---|---|---|
+| `Hermes Bot MAIN / Orchestrator` | Supervisor, judge, merge, deploy, roadmap owner | All, primarily `src/hermes_agent/shared/`, `config/`, `schemas/`, `docs/`, `scripts/` |
+| `Hermes Bot Product Manager` | Convert ideas into specs | `docs/specs/` |
+| `Hermes Bot Research / Analysis` | External research, tech choices, decision memos | `docs/research/` |
+| `Hermes Bot Developer Core` | Critical runtime, business logic | `src/hermes_agent/core/`, `src/hermes_agent/runtime/`, `src/hermes_agent/gateway/`, `src/hermes_agent/orchestration/` only |
+| `Hermes Bot Developer Edge` | Integrations, plugins, experiments | `src/hermes_agent/integrations/`, `src/hermes_agent/plugins/`, `src/hermes_agent/automations/`, `src/hermes_agent/telegram/` only |
+| `Hermes Bot QA / BugFix` | Bug reports, regressions, fixes | Any code when fixing a labeled bug, with scope justification |
+
+Adopt the role implied by the task. If unclear, default to MAIN and route.
+
+## Execution Policy
+
+Default behavior: continue execution until the task is complete. Do not request intermediate confirmations. Do not ask "should I proceed" or "is this correct" between steps.
+
+Only stop and escalate on these triggers:
+
+1. **Contradiction**: new instruction conflicts with `ROADMAP.md` or a previous instruction in this session.
+2. **Architectural decision**: a choice affects more than two modules or would cost more than two hours to redo if wrong.
+3. **Irreversible action**: production deploy, force push, schema migration, data deletion, or anything not reversible in under five minutes.
+4. **Stuck-after-retry**: failure persists after three attempts and root cause remains unclear after honest investigation.
+5. **Ambiguity unresolvable from context**: required info is absent from `AGENTS.md`, `ROADMAP.md`, docs, and code, and materially changes the approach.
+
+Escalation channel: skill `hermes-escalate-telegram` pushes to АЮ at Telegram chat id `10954083`.
+
+After each completed step in a multi-step task, update `ROADMAP.md` through the roadmap keeper workflow. Do not send routine progress reports to АЮ unless asked.
+
+## Domain Ownership
+
+| Zone | Owner |
+|---|---|
+| `src/hermes_agent/core/`, `src/hermes_agent/runtime/`, `src/hermes_agent/gateway/`, `src/hermes_agent/orchestration/` | Developer Core only |
+| `src/hermes_agent/integrations/`, `src/hermes_agent/plugins/`, `src/hermes_agent/automations/`, `src/hermes_agent/telegram/` | Developer Edge only |
+| `src/hermes_agent/shared/`, `config/`, `schemas/`, `docs/`, `scripts/` | MAIN only, or explicit MAIN escalation |
+
+Hook `domain-guard` enforces this once Phase 3 is installed. Cross-domain features are split by MAIN into ordered sub-PRs.
+
+## Parallel Work Rules
+
+- Each Developer thread runs in worktree mode. Never share a working tree.
+- Feature branches: `feature/core-<name>` for Developer Core and `feature/edge-<name>` for Developer Edge.
+- MAIN merges sequentially, never two PRs at once.
+- Two Developers on the same branch is forbidden.
+
+## Label Invariants
+
+Every issue and PR must have:
+- exactly one `lane:*` label (`main`, `pm`, `research`, `dev-core`, `dev-edge`, or `qa`)
+- exactly one `type:*` label (`bug`, `feature`, `refactor`, `docs`, `research`, or `chore`)
+- exactly one `status:*` label (`triage`, `backlog`, `in_progress`, `blocked`, `review`, or `done`)
+- at most one `risk:*` label (`production`, `data`, or `security`)
+
+Full scheme: `.github/labels.yml`. Validated by `hermes-label-check` after Phase 2.
+
+## Production Safety
+
+Never deploy without acquiring the production lock first. Lock path: `/root/.hermes/codex_locks/production.json`.
+
+Before restart, verify the live process model. The known production process is `python -m hermes_cli.main gateway run`; do not blindly run `systemctl restart hermes-gateway`.
+
+Never:
+- remove `/usr/local/lib/hermes-agent`
+- force push to `main`
+- run `git reset --hard` without explicit АЮ confirmation
+- hand-edit `ROADMAP.md` once roadmap keeper is installed
+
+## Definition of Done
+
+A task is done only if:
+- code changes have tests, or a clear "no test needed" note
+- `ROADMAP.md` is updated when the task affects status
+- PR description references the relevant issue when one exists
+- label invariants hold
+- if `risk:production`, deploy and live checks have passed
+
+## How To Talk To АЮ
+
+- Default language: Russian.
+- АЮ is not a developer. Explain what changed and why, not implementation internals unless asked.
+- For irreversible actions, pause and ask via Telegram escalation, not casual Codex chat.
+- Keep mobile-facing updates short.
+
+## Hand-off Contracts
+
+Every hand-off between agents goes through a structured contract:
+- Research to PM: decision memo with options, trade-offs, and recommendation.
+- PM to Developer: spec with definition of done, edge cases, test plan, and domain.
+- Developer to MAIN: PR with description, test results, and roadmap update.
+- QA to Developer: bug report with reproduction steps, expected vs actual, and screenshot if UI.
+
+## What To Read Besides This File
+
+- `ROADMAP.md`: current plan and status.
+- `docs/ARCHITECTURE.md`: orchestration structure once Phase 6 lands.
+- `docs/PROMPT_DECK.md`: short phrases АЮ uses once Phase 6 lands.
+- `.github/labels.yml`: label scheme.
+
+---
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.

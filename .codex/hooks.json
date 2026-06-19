@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/hermes_codex_policy.py\"",
+            "timeout": 30,
+            "statusMessage": "Checking Hermes guard rails"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/hermes_codex_policy.py\"",
+            "timeout": 30,
+            "statusMessage": "Scanning Hermes edit output"
+          }
+        ]
+      }
+    ]
+  }
+}

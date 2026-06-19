@@ -48,6 +48,8 @@ PTB_INVALID_TOKEN_404 = InvalidToken(
 
 def _make_adapter(extra=None):
     """Build a TelegramAdapter with a mock bot wired for the rich path."""
+    if extra is None:
+        extra = {"rich_messages": True}
     config = PlatformConfig(enabled=True, token="fake-token", extra=extra or {})
     adapter = TelegramAdapter(config)
     bot = MagicMock()
@@ -180,8 +182,8 @@ async def test_rich_messages_opt_out_accepts_string_false():
 
 
 @pytest.mark.asyncio
-async def test_rich_messages_default_is_enabled():
-    adapter = _make_adapter()
+async def test_rich_messages_explicit_opt_in_uses_rich_send():
+    adapter = _make_adapter(extra={"rich_messages": True})
 
     result = await adapter.send("12345", RICH_CONTENT)
 
@@ -190,6 +192,19 @@ async def test_rich_messages_default_is_enabled():
     assert bot is not None
     bot.do_api_request.assert_awaited_once()
     bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_default_is_legacy_for_client_compatibility():
+    adapter = _make_adapter(extra={})
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    bot = adapter._bot
+    assert bot is not None
+    bot.do_api_request.assert_not_called()
+    bot.send_message.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -312,7 +327,7 @@ async def test_real_ptb_endpoint_missing_falls_back_and_latches_off(exc):
 
 @pytest.mark.asyncio
 async def test_rich_payload_preserves_link_preview_disable():
-    adapter = _make_adapter(extra={"disable_link_previews": True})
+    adapter = _make_adapter(extra={"disable_link_previews": True, "rich_messages": True})
 
     result = await adapter.send("12345", "See https://example.com")
 

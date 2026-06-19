@@ -28,6 +28,16 @@ def _make_telegram_group_source() -> SessionSource:
     )
 
 
+def _make_telegram_dm_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="10954083",
+        chat_type="dm",
+        user_id="10954083",
+        thread_id=None,
+    )
+
+
 def _make_runner(extra=None):
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
@@ -152,17 +162,50 @@ def test_exec_approval_target_routes_telegram_group_to_home_channel():
     assert metadata == {"thread_id": "777"}
 
 
-def test_exec_approval_target_falls_back_to_source_without_home_channel():
+def test_exec_approval_target_rejects_telegram_group_without_home_channel():
     runner, adapter = _make_telegram_runner()
     runner.config.platforms[Platform.TELEGRAM].home_channel = None
     source = _make_telegram_group_source()
 
+    with pytest.raises(RuntimeError, match="operator home channel"):
+        runner._exec_approval_delivery_target(
+            source,
+            fallback_chat_id=source.chat_id,
+            fallback_metadata={"thread_id": source.thread_id},
+            adapter=adapter,
+        )
+
+
+def test_exec_approval_target_rejects_telegram_group_when_home_is_same_topic():
+    runner, adapter = _make_telegram_runner()
+    source = _make_telegram_group_source()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id=source.chat_id,
+        name="General",
+        thread_id=source.thread_id,
+    )
+
+    with pytest.raises(RuntimeError, match="operator home channel"):
+        runner._exec_approval_delivery_target(
+            source,
+            fallback_chat_id=source.chat_id,
+            fallback_metadata={"thread_id": source.thread_id},
+            adapter=adapter,
+        )
+
+
+def test_exec_approval_target_keeps_telegram_dm_fallback_without_home_channel():
+    runner, adapter = _make_telegram_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = None
+    source = _make_telegram_dm_source()
+
     chat_id, metadata = runner._exec_approval_delivery_target(
         source,
         fallback_chat_id=source.chat_id,
-        fallback_metadata={"thread_id": source.thread_id},
+        fallback_metadata=None,
         adapter=adapter,
     )
 
-    assert chat_id == "-1003716216649"
-    assert metadata == {"thread_id": "644"}
+    assert chat_id == "10954083"
+    assert metadata is None

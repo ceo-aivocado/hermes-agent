@@ -1,4 +1,6 @@
 import json
+import time
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -101,6 +103,19 @@ class _FakeSheetAppendProcess:
 
     async def communicate(self):
         return self._stdout.encode(), self._stderr.encode()
+
+
+class _FakeGoogleSheetsResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return b'{"updates":{"updatedCells":9}}'
 
 
 @pytest.mark.asyncio
@@ -508,6 +523,101 @@ async def test_source_replay_completes_sheet_outbox_directly_when_configured(mon
         "source_sheet_append_started",
         "sheet_write_succeeded",
     ]
+
+
+@pytest.mark.asyncio
+async def test_source_replay_uses_mcp_google_token_when_google_api_auth_is_missing(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    event = _link_summary_event()
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir()
+    (token_dir / "google-workspace.json").write_text(
+        json.dumps(
+            {
+                "access_token": "ya29.mcp-access-token",
+                "token_type": "Bearer",
+                "scope": "openid https://www.googleapis.com/auth/spreadsheets",
+                "expires_at": time.time() + 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SOURCE_SHEET_ID", "sheet-123")
+    monkeypatch.setenv("HERMES_SOURCE_SHEET_RANGE", "Sources!A:I")
+    monkeypatch.setenv("HERMES_GOOGLE_API_SCRIPT", str(tmp_path / "missing-google-api.py"))
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _FakeGoogleSheetsResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    runner._run_agent = AsyncMock()
+
+    summary = await runner._replay_source_intake_pending(limit=5)
+
+    assert summary["sheet_outbox_succeeded"] == 1
+    assert summary["queued"] == 0
+    runner._run_agent.assert_not_called()
+    assert "/v4/spreadsheets/sheet-123/values/Sources%21A%3AI:append" in captured["url"]
+    assert captured["headers"]["Authorization"] == "Bearer ya29.mcp-access-token"
+    assert captured["body"]["values"][0][2] == records[0]["url_or_ref"]
+    assert captured["body"]["values"][0][3] == "Конспект готов."
+    assert captured["timeout"] > 0
+
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "source_sheet_write_completed"
+    assert ledger_rows[-1]["sheet_status"] == "succeeded"
+    assert ledger_rows[-1]["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_source_replay_blocks_direct_writer_when_no_usable_auth_exists(
+    monkeypatch,
+    tmp_path,
+):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    event = _link_summary_event()
+    record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    monkeypatch.setenv("HERMES_SOURCE_SHEET_ID", "sheet-123")
+    monkeypatch.setenv("HERMES_GOOGLE_API_SCRIPT", str(tmp_path / "missing-google-api.py"))
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Replay did not write Sheet.",
+            "messages": [],
+            "history_offset": 0,
+        }
+    )
+
+    summary = await runner._replay_source_intake_pending(limit=5)
+
+    assert summary["sheet_outbox_blocked"] == 1
+    assert summary["queued"] == 1
+    outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
+    blocked_rows = [row for row in outbox_rows if row["event"] == "sheet_write_blocked"]
+    assert blocked_rows
+    assert blocked_rows[-1]["status"] == "pending"
+    assert "ya29" not in blocked_rows[-1].get("error", "")
 
 
 def test_source_replay_periodic_sweep_respects_interval(monkeypatch, tmp_path):

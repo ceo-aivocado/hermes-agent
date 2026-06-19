@@ -1,0 +1,71 @@
+name: Roadmap Consistency
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "ROADMAP.md"
+      - ".github/scripts/hermes_roadmap_consistency.py"
+      - ".github/scripts/hermes_github_api.py"
+      - ".github/workflows/roadmap-consistency.yml"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to validate"
+        required: true
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: roadmap-consistency-${{ github.event.pull_request.number || inputs.pr_number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check OPENAI_API_KEY secret
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error title=Missing OPENAI_API_KEY::Add OPENAI_API_KEY in repository Actions secrets before enabling Hermes Codex gates."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR refs
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin \
+            "$PR_BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
+
+      - name: Run Codex roadmap review
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            Check whether this PR's ROADMAP.md changes look consistent with Hermes roadmap keeper policy.
+            ROADMAP.md changes must come from commits whose subject matches chore(roadmap): <short update>.
+            Do not edit files or post comments; the next deterministic CI step posts the failure comment and fails the check.
+          sandbox: read-only
+          output-file: .codex-roadmap-consistency.md
+
+      - name: Validate ROADMAP.md consistency
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HERMES_PR_NUMBER: ${{ inputs.pr_number }}
+        run: python3 .github/scripts/hermes_roadmap_consistency.py

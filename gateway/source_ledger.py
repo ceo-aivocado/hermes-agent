@@ -11,6 +11,17 @@ _TELEGRAM_INTERNAL_URL_RE = re.compile(
     r"(?i)^https?://t\.me/(?:c/\d+/\d+|[A-Za-z0-9_]+/\d+)\b"
 )
 _TRAILING_URL_PUNCTUATION = ".,;:!?)]}\"'"
+_SOURCE_SHEET_COLUMNS = (
+    "created_at",
+    "kind",
+    "url_or_ref",
+    "summary_text",
+    "source_id",
+    "chat_id",
+    "thread_id",
+    "message_id",
+    "submitted_by",
+)
 
 
 def source_intake_dir(hermes_home: Path) -> Path:
@@ -127,6 +138,14 @@ def _existing_source_ids(path: Path, *, event_name: str = "source_discovered") -
     return existing
 
 
+def _summary_text(response_text: str) -> str:
+    return str(response_text or "").strip()
+
+
+def build_source_sheet_row(record: dict[str, Any]) -> list[str]:
+    return [str(record.get(column) or "") for column in _SOURCE_SHEET_COLUMNS]
+
+
 def _source_urls_and_message_ids(event: Any) -> tuple[list[str], str, str]:
     trigger_message_id = str(getattr(event, "message_id", "") or "")
     reply_to_text = str(getattr(event, "reply_to_text", "") or "")
@@ -237,6 +256,7 @@ def record_link_summary_result(
                 "status": status,
                 "sheet_status": sheet_status,
                 "created_at": created_at,
+                "summary_text": _summary_text(response_text),
                 "done": bool(response_present and sheet_write_succeeded),
             }
             for record in records
@@ -250,6 +270,12 @@ def record_link_summary_result(
                 "status": outbox_status,
                 "source_id": record["source_id"],
                 "url_or_ref": record["url_or_ref"],
+                "kind": record.get("kind", ""),
+                "chat_id": record.get("chat_id", ""),
+                "thread_id": record.get("thread_id", ""),
+                "message_id": record.get("message_id", ""),
+                "submitted_by": record.get("submitted_by", ""),
+                "summary_text": _summary_text(response_text),
                 "created_at": created_at,
             }
             for record in records
@@ -414,6 +440,133 @@ def pending_source_replay_records(
         if len(pending) >= limit:
             break
     return pending
+
+
+def pending_source_sheet_outbox_records(
+    hermes_home: Path,
+    *,
+    limit: int = 25,
+    max_attempts: int = 3,
+) -> list[dict[str, Any]]:
+    intake_dir = source_intake_dir(hermes_home)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
+
+    latest_ledger_by_id: dict[str, dict[str, Any]] = {}
+    succeeded_ids: set[str] = set()
+    attempts_by_id: dict[str, int] = {}
+    for row in ledger_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id:
+            continue
+        latest_ledger_by_id[source_id] = row
+        if row.get("sheet_status") == "succeeded" or row.get("done") is True:
+            succeeded_ids.add(source_id)
+        if row.get("event") == "source_sheet_append_started":
+            attempts_by_id[source_id] = attempts_by_id.get(source_id, 0) + 1
+
+    latest_outbox_by_id: dict[str, dict[str, Any]] = {}
+    for row in outbox_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id:
+            continue
+        event_name = str(row.get("event") or "")
+        latest_outbox_by_id[source_id] = row
+        if row.get("status") == "succeeded" or event_name == "sheet_write_succeeded":
+            succeeded_ids.add(source_id)
+        if event_name == "source_sheet_append_started":
+            attempts_by_id[source_id] = attempts_by_id.get(source_id, 0) + 1
+
+    pending: list[dict[str, Any]] = []
+    for source_id, outbox in latest_outbox_by_id.items():
+        if source_id in succeeded_ids:
+            continue
+        if outbox.get("status") != "pending":
+            continue
+        record = dict(latest_ledger_by_id.get(source_id) or {})
+        record.update(outbox)
+        if not str(record.get("summary_text") or "").strip():
+            continue
+        attempts = attempts_by_id.get(source_id, 0)
+        if attempts >= max(0, max_attempts):
+            continue
+        record["outbox_attempts"] = attempts
+        pending.append(record)
+        if len(pending) >= limit:
+            break
+    return pending
+
+
+def record_source_sheet_append_started(hermes_home: Path, record: dict[str, Any]) -> None:
+    created_at = _now_iso()
+    row = {
+        "event": "source_sheet_append_started",
+        "status": "pending",
+        "source_id": record.get("source_id", ""),
+        "url_or_ref": record.get("url_or_ref", ""),
+        "created_at": created_at,
+    }
+    _append_jsonl(source_intake_dir(hermes_home) / "sheet_outbox.jsonl", [row])
+
+
+def record_source_sheet_append_result(
+    hermes_home: Path,
+    record: dict[str, Any],
+    *,
+    succeeded: bool = False,
+    blocked: bool = False,
+    error: str = "",
+) -> None:
+    created_at = _now_iso()
+    if succeeded:
+        ledger_event = "source_sheet_write_completed"
+        ledger_status = "done"
+        sheet_status = "succeeded"
+        outbox_event = "sheet_write_succeeded"
+        outbox_status = "succeeded"
+    elif blocked:
+        ledger_event = "source_sheet_write_blocked"
+        ledger_status = "save_pending"
+        sheet_status = "blocked"
+        outbox_event = "sheet_write_blocked"
+        outbox_status = "pending"
+    else:
+        ledger_event = "source_sheet_write_failed"
+        ledger_status = "save_pending"
+        sheet_status = "failed"
+        outbox_event = "sheet_write_failed"
+        outbox_status = "pending"
+
+    common = {
+        **record,
+        "created_at": created_at,
+        "sheet_status": sheet_status,
+        "error": str(error or "")[:500],
+    }
+    _append_jsonl(
+        source_intake_dir(hermes_home) / "source_ledger.jsonl",
+        [
+            {
+                **common,
+                "event": ledger_event,
+                "status": ledger_status,
+                "done": bool(succeeded),
+            }
+        ],
+    )
+    _append_jsonl(
+        source_intake_dir(hermes_home) / "sheet_outbox.jsonl",
+        [
+            {
+                "event": outbox_event,
+                "status": outbox_status,
+                "source_id": record.get("source_id", ""),
+                "url_or_ref": record.get("url_or_ref", ""),
+                "created_at": created_at,
+                "error": str(error or "")[:500],
+            }
+        ],
+    )
 
 
 def record_source_replay_started(hermes_home: Path, source_record: dict[str, Any]) -> None:

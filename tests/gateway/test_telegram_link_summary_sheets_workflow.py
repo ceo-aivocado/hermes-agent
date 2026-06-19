@@ -93,6 +93,16 @@ def _read_source_intake_jsonl(tmp_path, filename):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+class _FakeSheetAppendProcess:
+    def __init__(self, *, returncode=0, stdout='{"updatedCells": 9}', stderr=""):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    async def communicate(self):
+        return self._stdout.encode(), self._stderr.encode()
+
+
 @pytest.mark.asyncio
 async def test_link_summary_forces_google_workspace_skill_in_existing_session(monkeypatch, tmp_path):
     runner = _bootstrap_runner(monkeypatch, tmp_path)
@@ -410,6 +420,11 @@ async def test_source_replay_retries_pending_sheet_write_quietly(monkeypatch, tm
     assert summary == {
         "queued": 1,
         "attempted": 1,
+        "sheet_outbox_queued": 0,
+        "sheet_outbox_attempted": 0,
+        "sheet_outbox_succeeded": 0,
+        "sheet_outbox_failed": 0,
+        "sheet_outbox_blocked": 0,
         "sheet_write_attempted": 1,
         "sheet_write_succeeded": 1,
         "sheet_write_failed": 0,
@@ -431,6 +446,68 @@ async def test_source_replay_retries_pending_sheet_write_quietly(monkeypatch, tm
     outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
     assert outbox_rows[-1]["event"] == "sheet_write_succeeded"
     assert outbox_rows[-1]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_source_replay_completes_sheet_outbox_directly_when_configured(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    event = _link_summary_event()
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+
+    script_path = tmp_path / "google_api.py"
+    script_path.write_text("# fake google api", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SOURCE_SHEET_ID", "sheet-123")
+    monkeypatch.setenv("HERMES_SOURCE_SHEET_RANGE", "Sources!A:I")
+    monkeypatch.setenv("HERMES_GOOGLE_API_SCRIPT", str(script_path))
+
+    calls = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        calls.append((args, kwargs))
+        return _FakeSheetAppendProcess()
+
+    monkeypatch.setattr(gateway_run.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner._run_agent = AsyncMock()
+
+    summary = await runner._replay_source_intake_pending(limit=5)
+
+    assert summary["sheet_outbox_queued"] == 1
+    assert summary["sheet_outbox_attempted"] == 1
+    assert summary["sheet_outbox_succeeded"] == 1
+    assert summary["queued"] == 0
+    runner._run_agent.assert_not_called()
+
+    args, kwargs = calls[0]
+    assert args[:5] == (
+        gateway_run.sys.executable,
+        str(script_path),
+        "sheets",
+        "append",
+        "sheet-123",
+    )
+    assert args[5] == "Sources!A:I"
+    assert kwargs["stdout"] is gateway_run.asyncio.subprocess.PIPE
+    values = json.loads(args[7])
+    assert values[0][2] == records[0]["url_or_ref"]
+    assert values[0][3] == "Конспект готов."
+    assert values[0][4] == records[0]["source_id"]
+
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "source_sheet_write_completed"
+    assert ledger_rows[-1]["sheet_status"] == "succeeded"
+    assert ledger_rows[-1]["done"] is True
+
+    outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
+    assert [row["event"] for row in outbox_rows[-2:]] == [
+        "source_sheet_append_started",
+        "sheet_write_succeeded",
+    ]
 
 
 def test_source_replay_periodic_sweep_respects_interval(monkeypatch, tmp_path):

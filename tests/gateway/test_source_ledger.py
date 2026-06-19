@@ -5,10 +5,14 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 from gateway.source_ledger import (
+    build_source_sheet_row,
+    pending_source_sheet_outbox_records,
     pending_source_replay_records,
     recover_source_intake_pending,
     record_link_summary_result,
     record_link_summary_sources,
+    record_source_sheet_append_result,
+    record_source_sheet_append_started,
     record_source_replay_result,
     record_source_replay_started,
     source_intake_dir,
@@ -146,12 +150,14 @@ def test_record_link_summary_result_keeps_sheet_pending_when_write_missing(tmp_p
     assert result_row["source_id"] == records[0]["source_id"]
     assert result_row["status"] == "published_without_save"
     assert result_row["sheet_status"] == "pending"
+    assert result_row["summary_text"] == "Конспект готов."
     assert result_row["done"] is False
 
     outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
     assert outbox_rows[-1]["event"] == "sheet_write_missing"
     assert outbox_rows[-1]["source_id"] == records[0]["source_id"]
     assert outbox_rows[-1]["status"] == "pending"
+    assert outbox_rows[-1]["summary_text"] == "Конспект готов."
 
 
 def test_record_link_summary_result_marks_sheet_attempt_without_done(tmp_path):
@@ -235,6 +241,74 @@ def test_record_link_summary_result_marks_sheet_failed_pending(tmp_path):
 
     pending = pending_source_replay_records(tmp_path)
     assert [row["source_id"] for row in pending] == [records[0]["source_id"]]
+
+
+def test_pending_source_sheet_outbox_records_returns_payload_rows(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+
+    pending = pending_source_sheet_outbox_records(tmp_path)
+
+    assert [row["source_id"] for row in pending] == [records[0]["source_id"]]
+    assert pending[0]["summary_text"] == "Конспект готов."
+    assert build_source_sheet_row(pending[0]) == [
+        pending[0]["created_at"],
+        "link",
+        "https://example.com/source",
+        "Конспект готов.",
+        records[0]["source_id"],
+        "-1001",
+        "777",
+        "msg-42",
+        "12345",
+    ]
+
+
+def test_pending_source_sheet_outbox_records_skips_after_sheet_success(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    pending = pending_source_sheet_outbox_records(tmp_path)
+    assert pending
+
+    record_source_sheet_append_result(tmp_path, pending[0], succeeded=True)
+
+    assert pending_source_sheet_outbox_records(tmp_path) == []
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "source_sheet_write_completed"
+    assert ledger_rows[-1]["source_id"] == records[0]["source_id"]
+    assert ledger_rows[-1]["sheet_status"] == "succeeded"
+    assert ledger_rows[-1]["done"] is True
+
+
+def test_pending_source_sheet_outbox_records_retries_started_without_result(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    pending = pending_source_sheet_outbox_records(tmp_path)
+    record_source_sheet_append_started(tmp_path, pending[0])
+
+    retry = pending_source_sheet_outbox_records(tmp_path, max_attempts=2)
+
+    assert [row["source_id"] for row in retry] == [pending[0]["source_id"]]
+    assert retry[0]["outbox_attempts"] == 1
 
 
 def test_recover_source_intake_repairs_missing_outbox_after_restart(tmp_path):

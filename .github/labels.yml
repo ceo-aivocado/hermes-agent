@@ -1,0 +1,72 @@
+- name: lane:main
+  color: "5319E7"
+  description: MAIN / Orchestrator owned work
+- name: lane:pm
+  color: "1D76DB"
+  description: Product Manager owned work
+- name: lane:research
+  color: "0E8A16"
+  description: Research / Analysis owned work
+- name: lane:dev-core
+  color: "B60205"
+  description: Developer Core owned work
+- name: lane:dev-edge
+  color: "FBCA04"
+  description: Developer Edge owned work
+- name: lane:qa
+  color: "D93F0B"
+  description: QA / BugFix owned work
+- name: type:bug
+  color: "D73A4A"
+  description: Something is broken
+- name: type:feature
+  color: "A2EEEF"
+  description: New user-facing or operator-facing capability
+- name: type:refactor
+  color: "C5DEF5"
+  description: Internal code restructuring without intended behavior change
+- name: type:docs
+  color: "0075CA"
+  description: Documentation-only work
+- name: type:research
+  color: "0E8A16"
+  description: Investigation or decision memo
+- name: type:chore
+  color: "C2E0C6"
+  description: Maintenance, configuration, or repository hygiene
+- name: status:triage
+  color: "EDEDED"
+  description: Needs classification and routing
+- name: status:backlog
+  color: "C5DEF5"
+  description: Accepted but not active
+- name: status:in_progress
+  color: "FBCA04"
+  description: Actively being worked
+- name: status:blocked
+  color: "B60205"
+  description: Blocked on owner, dependency, or external state
+- name: status:review
+  color: "5319E7"
+  description: Waiting for review or approval
+- name: status:done
+  color: "0E8A16"
+  description: Completed and verified
+- name: risk:production
+  color: "B60205"
+  description: Can affect production runtime or deploy state
+- name: risk:data
+  color: "D93F0B"
+  description: Can affect persisted data, ledgers, transcripts, or Sheets
+- name: risk:security
+  color: "000000"
+  description: Can affect credentials, permissions, or security posture
+- name: domain:core
+  color: "B60205"
+  description: Core runtime, gateway, protocol, or orchestration domain
+- name: domain:edge
+  color: "FBCA04"
+  description: Integrations, plugins, automations, or Telegram domain
+- name: domain:shared
+  color: "5319E7"
+  description: Shared config, schemas, docs, scripts, or utilities

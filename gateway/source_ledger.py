@@ -193,6 +193,8 @@ def record_link_summary_result(
     *,
     response_text: str,
     sheet_write_attempted: bool,
+    sheet_write_succeeded: bool = False,
+    sheet_write_failed: bool = False,
 ) -> None:
     records = getattr(event, "telegram_source_ledger_records", None)
     if not records:
@@ -203,10 +205,27 @@ def record_link_summary_result(
     created_at = _now_iso()
     response_present = bool(str(response_text or "").strip())
     status = "summary_created" if sheet_write_attempted else "published_without_save"
+    if sheet_write_failed:
+        status = "published_without_save"
     if not response_present:
         status = "processing"
-    sheet_status = "write_attempted" if sheet_write_attempted else "pending"
+    if sheet_write_succeeded:
+        sheet_status = "succeeded"
+    elif sheet_write_failed:
+        sheet_status = "failed"
+    else:
+        sheet_status = "write_attempted" if sheet_write_attempted else "pending"
     event_name = "summary_created" if response_present else "processing"
+
+    if sheet_write_succeeded:
+        outbox_event = "sheet_write_succeeded"
+        outbox_status = "succeeded"
+    elif sheet_write_failed:
+        outbox_event = "sheet_write_failed"
+        outbox_status = "pending"
+    else:
+        outbox_event = "sheet_write_attempted" if sheet_write_attempted else "sheet_write_missing"
+        outbox_status = "attempted" if sheet_write_attempted else "pending"
 
     intake_dir = source_intake_dir(hermes_home)
     _append_jsonl(
@@ -218,7 +237,7 @@ def record_link_summary_result(
                 "status": status,
                 "sheet_status": sheet_status,
                 "created_at": created_at,
-                "done": False,
+                "done": bool(response_present and sheet_write_succeeded),
             }
             for record in records
         ],
@@ -227,8 +246,8 @@ def record_link_summary_result(
         intake_dir / "sheet_outbox.jsonl",
         [
             {
-                "event": "sheet_write_attempted" if sheet_write_attempted else "sheet_write_missing",
-                "status": "attempted" if sheet_write_attempted else "pending",
+                "event": outbox_event,
+                "status": outbox_status,
                 "source_id": record["source_id"],
                 "url_or_ref": record["url_or_ref"],
                 "created_at": created_at,
@@ -358,12 +377,15 @@ def pending_source_replay_records(
         latest_source_row_by_id[source_id] = row
 
     sheet_attempted_ids: set[str] = set()
+    sheet_succeeded_ids: set[str] = set()
     sheet_pending_ids: set[str] = set()
     for row in outbox_rows:
         source_id = str(row.get("source_id") or "")
         if not source_id:
             continue
         event_name = str(row.get("event") or "")
+        if row.get("status") == "succeeded" or event_name == "sheet_write_succeeded":
+            sheet_succeeded_ids.add(source_id)
         if row.get("status") == "attempted" or event_name == "sheet_write_attempted":
             sheet_attempted_ids.add(source_id)
         if row.get("status") == "pending":
@@ -371,6 +393,8 @@ def pending_source_replay_records(
 
     pending: list[dict[str, Any]] = []
     for source_id, discovered in discovered_by_id.items():
+        if source_id in sheet_succeeded_ids:
+            continue
         if source_id in sheet_attempted_ids:
             continue
         latest = latest_source_row_by_id.get(source_id) or discovered
@@ -415,11 +439,26 @@ def record_source_replay_result(
     *,
     response_text: str = "",
     sheet_write_attempted: bool = False,
+    sheet_write_succeeded: bool = False,
+    sheet_write_failed: bool = False,
     error: str = "",
 ) -> None:
     created_at = _now_iso()
-    event_name = "source_replay_completed" if not error else "source_replay_failed"
-    status = "replay_failed" if error else "replay_completed" if sheet_write_attempted else "replay_pending"
+    replay_failed = bool(error or sheet_write_failed)
+    event_name = "source_replay_failed" if replay_failed else "source_replay_completed"
+    status = (
+        "replay_failed"
+        if replay_failed
+        else "replay_completed"
+        if sheet_write_succeeded
+        else "replay_pending"
+    )
+    if sheet_write_succeeded:
+        sheet_status = "succeeded"
+    elif sheet_write_failed:
+        sheet_status = "failed"
+    else:
+        sheet_status = "write_attempted" if sheet_write_attempted else "pending"
     _append_jsonl(
         source_intake_dir(hermes_home) / "source_ledger.jsonl",
         [
@@ -427,9 +466,9 @@ def record_source_replay_result(
                 **source_record,
                 "event": event_name,
                 "status": status,
-                "sheet_status": "write_attempted" if sheet_write_attempted else "pending",
+                "sheet_status": sheet_status,
                 "created_at": created_at,
-                "done": False,
+                "done": bool(sheet_write_succeeded),
                 "response_present": bool(str(response_text or "").strip()),
                 "error": str(error or "")[:500],
             }

@@ -5072,6 +5072,207 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return scheduled
 
+    @staticmethod
+    def _source_replay_platform(record: dict[str, Any]) -> Platform:
+        raw = str(record.get("origin_platform") or "telegram").strip().lower()
+        try:
+            return Platform(raw)
+        except ValueError:
+            return Platform.TELEGRAM
+
+    @staticmethod
+    def _source_replay_chat_type(record: dict[str, Any]) -> str:
+        chat_type = str(record.get("chat_type") or "").strip()
+        if chat_type:
+            return chat_type
+        chat_id = str(record.get("chat_id") or "")
+        return "group" if chat_id.startswith("-") else "dm"
+
+    def _source_replay_event_from_record(self, record: dict[str, Any]) -> MessageEvent:
+        source = SessionSource(
+            platform=self._source_replay_platform(record),
+            chat_id=str(record.get("chat_id") or ""),
+            chat_type=self._source_replay_chat_type(record),
+            user_id=str(record.get("submitted_by") or "") or "system:source-replay",
+            user_name="Source Replay",
+            thread_id=str(record.get("thread_id") or "") or None,
+            message_id=str(record.get("message_id") or "") or None,
+        )
+        event = MessageEvent(
+            text=self._source_replay_message(record),
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=str(record.get("message_id") or "") or None,
+            internal=True,
+        )
+        event.auto_skill = "google-workspace"
+        event.force_auto_skill_injection = True  # type: ignore[attr-defined]
+        event.telegram_interaction_intent = "link_summary"  # type: ignore[attr-defined]
+        event.telegram_link_summary_requires_sheet_write = True  # type: ignore[attr-defined]
+        event.telegram_source_ledger_records = [dict(record)]  # type: ignore[attr-defined]
+        event.telegram_source_ledger_ids = [str(record.get("source_id") or "")]  # type: ignore[attr-defined]
+        event.telegram_source_replay = True  # type: ignore[attr-defined]
+        return event
+
+    @staticmethod
+    def _source_replay_message(record: dict[str, Any]) -> str:
+        source_id = str(record.get("source_id") or "")
+        url = str(record.get("url_or_ref") or "")
+        message_id = str(record.get("message_id") or "")
+        trigger_id = str(record.get("trigger_message_id") or "")
+        return (
+            "[Telegram external link summary recovery]\n"
+            "This is an automatic replay for a Telegram source whose synopsis or "
+            "Google Sheet/KB write was not confirmed before a gateway restart.\n"
+            "Fetch/read the external source again if needed, produce the concise synopsis, "
+            "and write/update the configured Google Sheet or Knowledge Base exactly once.\n"
+            "Do not send a public chat reply; only complete the Sheet/KB workflow and report "
+            "the write status in your final response.\n\n"
+            f"source_id: {source_id}\n"
+            f"source_message_id: {message_id}\n"
+            f"trigger_message_id: {trigger_id}\n"
+            f"url: {url}"
+        )
+
+    @staticmethod
+    def _inject_google_workspace_skill_for_replay(message: str, session_key: str) -> str:
+        try:
+            from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+            loaded = _load_skill_payload("google-workspace", task_id=session_key)
+            if not loaded:
+                return message
+            loaded_skill, skill_dir, display_name = loaded
+            note = (
+                f'[IMPORTANT: The "{display_name}" skill is auto-loaded for this '
+                "Telegram source recovery replay. Follow its instructions for this "
+                "request, then return to normal context.]"
+            )
+            skill_message = _build_skill_message(loaded_skill, skill_dir, note)
+            if not skill_message:
+                return message
+            return f"{skill_message}\n\n{message}"
+        except Exception as exc:
+            logger.warning("Source replay failed to load google-workspace skill: %s", exc)
+            return message
+
+    async def _replay_source_intake_pending(self, *, limit: int = 3, max_attempts: int = 3) -> dict[str, int]:
+        from gateway.source_ledger import (
+            pending_source_replay_records,
+            record_link_summary_result,
+            record_source_replay_result,
+            record_source_replay_started,
+        )
+
+        records = pending_source_replay_records(
+            _hermes_home,
+            limit=limit,
+            max_attempts=max_attempts,
+        )
+        summary = {
+            "queued": len(records),
+            "attempted": 0,
+            "sheet_write_attempted": 0,
+            "failed": 0,
+        }
+        for record in records:
+            source_id = str(record.get("source_id") or "")
+            event = self._source_replay_event_from_record(record)
+            session_key = f"source-replay:{source_id}"
+            session_id = f"source-replay-{source_id}"
+            context = build_session_context(event.source, self.config)
+            context.session_key = session_key
+            context.session_id = session_id
+            tokens = self._set_session_env(context)
+            record_source_replay_started(_hermes_home, record)
+            summary["attempted"] += 1
+            try:
+                try:
+                    _cfg = _load_gateway_config()
+                    _redact_pii = bool((_cfg.get("privacy") or {}).get("redact_pii", False))
+                except Exception:
+                    _redact_pii = False
+                context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+                message = self._inject_google_workspace_skill_for_replay(
+                    event.text,
+                    session_key,
+                )
+                agent_result = await self._run_agent(
+                    message=message,
+                    context_prompt=context_prompt,
+                    history=[],
+                    source=event.source,
+                    session_id=session_id,
+                    session_key=session_key,
+                    run_generation=None,
+                    event_message_id=None,
+                    channel_prompt=None,
+                    silent=True,
+                )
+                response = str(agent_result.get("final_response") or "")
+                agent_messages = agent_result.get("messages", [])
+                sheet_write_attempted = _agent_messages_include_google_sheet_write(agent_messages)
+                record_link_summary_result(
+                    _hermes_home,
+                    event,
+                    response_text=response,
+                    sheet_write_attempted=sheet_write_attempted,
+                )
+                record_source_replay_result(
+                    _hermes_home,
+                    record,
+                    response_text=response,
+                    sheet_write_attempted=sheet_write_attempted,
+                )
+                if sheet_write_attempted:
+                    summary["sheet_write_attempted"] += 1
+            except Exception as exc:
+                summary["failed"] += 1
+                logger.warning("Source replay failed for %s: %s", source_id or "unknown", exc)
+                record_source_replay_result(
+                    _hermes_home,
+                    record,
+                    error=str(exc),
+                )
+            finally:
+                self._clear_session_env(tokens)
+        if summary["attempted"]:
+            logger.info(
+                "Source intake replay: queued=%d attempted=%d sheet_write_attempted=%d failed=%d",
+                summary["queued"],
+                summary["attempted"],
+                summary["sheet_write_attempted"],
+                summary["failed"],
+            )
+        return summary
+
+    @staticmethod
+    def _source_replay_startup_limit() -> int:
+        raw = os.getenv("HERMES_SOURCE_REPLAY_STARTUP_LIMIT", "3")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 3
+
+    def _schedule_source_intake_replay(self) -> int:
+        limit = self._source_replay_startup_limit()
+        if limit <= 0:
+            return 0
+        try:
+            from gateway.source_ledger import pending_source_replay_records
+
+            pending = pending_source_replay_records(_hermes_home, limit=limit)
+        except Exception as exc:
+            logger.warning("Source replay scan failed: %s", exc)
+            return 0
+        if not pending:
+            return 0
+        task = asyncio.create_task(self._replay_source_intake_pending(limit=limit))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        logger.info("Scheduled source intake replay for %d pending source(s)", len(pending))
+        return len(pending)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -5582,6 +5783,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # visible for manual recovery on the next user message.
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        self._schedule_source_intake_replay()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -14006,6 +14208,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        silent: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14106,6 +14309,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             )
         )
+        if silent:
+            tool_progress_enabled = False
+            interim_assistant_messages_enabled = False
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
@@ -14742,7 +14948,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self.adapters.get(source.platform)
+        _status_adapter = None if silent else self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
@@ -14877,6 +15083,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if silent:
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages

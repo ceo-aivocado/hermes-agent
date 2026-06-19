@@ -83,6 +83,7 @@ def _base_record(
         "origin_platform": platform,
         "chat_id": str(getattr(source, "chat_id", "") or ""),
         "thread_id": str(getattr(source, "thread_id", "") or ""),
+        "chat_type": str(getattr(source, "chat_type", "") or ""),
         "message_id": source_message_id,
         "trigger_message_id": trigger_message_id,
         "submitted_by": str(getattr(source, "user_id", "") or ""),
@@ -324,3 +325,113 @@ def recover_source_intake_pending(hermes_home: Path) -> dict[str, int]:
         "repaired_outbox": len(repaired_outbox_rows),
         "recovery_required": len(recovery_rows),
     }
+
+
+def pending_source_replay_records(
+    hermes_home: Path,
+    *,
+    limit: int = 25,
+    max_attempts: int = 3,
+) -> list[dict[str, Any]]:
+    intake_dir = source_intake_dir(hermes_home)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
+
+    discovered_by_id: dict[str, dict[str, Any]] = {}
+    latest_source_row_by_id: dict[str, dict[str, Any]] = {}
+    recovery_required_ids: set[str] = set()
+    replay_attempts_by_id: dict[str, int] = {}
+    for row in ledger_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id:
+            continue
+        event_name = str(row.get("event") or "")
+        if event_name == "source_discovered" and source_id not in discovered_by_id:
+            discovered_by_id[source_id] = row
+        if event_name == "recovery_required":
+            recovery_required_ids.add(source_id)
+            continue
+        if event_name.startswith("source_replay_"):
+            replay_attempts_by_id[source_id] = replay_attempts_by_id.get(source_id, 0) + (
+                1 if event_name == "source_replay_started" else 0
+            )
+        latest_source_row_by_id[source_id] = row
+
+    sheet_attempted_ids: set[str] = set()
+    sheet_pending_ids: set[str] = set()
+    for row in outbox_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id:
+            continue
+        event_name = str(row.get("event") or "")
+        if row.get("status") == "attempted" or event_name == "sheet_write_attempted":
+            sheet_attempted_ids.add(source_id)
+        if row.get("status") == "pending":
+            sheet_pending_ids.add(source_id)
+
+    pending: list[dict[str, Any]] = []
+    for source_id, discovered in discovered_by_id.items():
+        if source_id in sheet_attempted_ids:
+            continue
+        latest = latest_source_row_by_id.get(source_id) or discovered
+        needs_replay = (
+            source_id in recovery_required_ids
+            or source_id in sheet_pending_ids
+            or latest.get("sheet_status") == "pending"
+        )
+        if not needs_replay:
+            continue
+        attempts = replay_attempts_by_id.get(source_id, 0)
+        if attempts >= max(0, max_attempts):
+            continue
+        record = dict(discovered)
+        record["replay_attempts"] = attempts
+        pending.append(record)
+        if len(pending) >= limit:
+            break
+    return pending
+
+
+def record_source_replay_started(hermes_home: Path, source_record: dict[str, Any]) -> None:
+    created_at = _now_iso()
+    _append_jsonl(
+        source_intake_dir(hermes_home) / "source_ledger.jsonl",
+        [
+            {
+                **source_record,
+                "event": "source_replay_started",
+                "status": "replay_processing",
+                "sheet_status": "pending",
+                "created_at": created_at,
+                "done": False,
+            }
+        ],
+    )
+
+
+def record_source_replay_result(
+    hermes_home: Path,
+    source_record: dict[str, Any],
+    *,
+    response_text: str = "",
+    sheet_write_attempted: bool = False,
+    error: str = "",
+) -> None:
+    created_at = _now_iso()
+    event_name = "source_replay_completed" if not error else "source_replay_failed"
+    status = "replay_failed" if error else "replay_completed" if sheet_write_attempted else "replay_pending"
+    _append_jsonl(
+        source_intake_dir(hermes_home) / "source_ledger.jsonl",
+        [
+            {
+                **source_record,
+                "event": event_name,
+                "status": status,
+                "sheet_status": "write_attempted" if sheet_write_attempted else "pending",
+                "created_at": created_at,
+                "done": False,
+                "response_present": bool(str(response_text or "").strip()),
+                "error": str(error or "")[:500],
+            }
+        ],
+    )

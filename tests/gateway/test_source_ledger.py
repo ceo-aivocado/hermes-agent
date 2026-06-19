@@ -5,9 +5,12 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 from gateway.source_ledger import (
+    pending_source_replay_records,
     recover_source_intake_pending,
     record_link_summary_result,
     record_link_summary_sources,
+    record_source_replay_result,
+    record_source_replay_started,
     source_intake_dir,
 )
 
@@ -263,3 +266,55 @@ def test_gateway_startup_recovery_sweeps_source_intake(monkeypatch, tmp_path):
     ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
     assert ledger_rows[-1]["event"] == "recovery_required"
     assert ledger_rows[-1]["recovery_reason"] == "sheet_write_pending"
+
+
+def test_pending_source_replay_records_returns_unwritten_recovery_sources(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    recover_source_intake_pending(tmp_path)
+
+    pending = pending_source_replay_records(tmp_path)
+
+    assert [row["source_id"] for row in pending] == [records[0]["source_id"]]
+    assert pending[0]["url_or_ref"] == "https://example.com/source"
+
+
+def test_pending_source_replay_records_skips_sheet_attempted_sources(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов и строка добавлена.",
+        sheet_write_attempted=True,
+    )
+    recover_source_intake_pending(tmp_path)
+
+    assert pending_source_replay_records(tmp_path) == []
+
+
+def test_pending_source_replay_records_respects_max_attempts(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    recover_source_intake_pending(tmp_path)
+    record_source_replay_started(tmp_path, records[0])
+    record_source_replay_result(
+        tmp_path,
+        records[0],
+        response_text="Не удалось записать таблицу.",
+        sheet_write_attempted=False,
+    )
+
+    assert pending_source_replay_records(tmp_path, max_attempts=1) == []

@@ -9,6 +9,11 @@ import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
+from gateway.source_ledger import (
+    recover_source_intake_pending,
+    record_link_summary_result,
+    record_link_summary_sources,
+)
 
 
 def _bootstrap_runner(monkeypatch, tmp_path):
@@ -293,6 +298,66 @@ async def test_link_summary_does_not_warn_when_sheet_append_tool_call_exists(mon
     )
 
     assert response == "Конспект готов и строка добавлена."
+    outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
+    assert outbox_rows[-1]["event"] == "sheet_write_attempted"
+    assert outbox_rows[-1]["status"] == "attempted"
+
+
+@pytest.mark.asyncio
+async def test_source_replay_retries_pending_sheet_write_quietly(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    event = _link_summary_event()
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    recover_source_intake_pending(tmp_path)
+
+    runner._clear_session_env = lambda _tokens: None
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Replay записал строку.",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_sheet",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": (
+                                    '{"cmd":"python skills/productivity/google-workspace/scripts/'
+                                    'google_api.py sheets append SHEET_ID Sheet1!A:C --values '
+                                    '\\"[[\\\\\\"url\\\\\\",\\\\\\"summary\\\\\\"]]\\\""}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_sheet", "content": '{"status":"ok"}'},
+            ],
+            "history_offset": 0,
+        }
+    )
+
+    summary = await runner._replay_source_intake_pending(limit=5)
+
+    assert summary == {"queued": 1, "attempted": 1, "sheet_write_attempted": 1, "failed": 0}
+    kwargs = runner._run_agent.await_args.kwargs
+    assert kwargs["history"] == []
+    assert kwargs["silent"] is True
+    assert "Telegram external link summary recovery" in kwargs["message"]
+    assert "Do not send a public chat reply" in kwargs["message"]
+    assert records[0]["url_or_ref"] in kwargs["message"]
+
+    ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "source_replay_completed"
+    assert ledger_rows[-1]["source_id"] == records[0]["source_id"]
+    assert ledger_rows[-1]["sheet_status"] == "write_attempted"
+
     outbox_rows = _read_source_intake_jsonl(tmp_path, "sheet_outbox.jsonl")
     assert outbox_rows[-1]["event"] == "sheet_write_attempted"
     assert outbox_rows[-1]["status"] == "attempted"

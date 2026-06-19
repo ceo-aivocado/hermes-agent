@@ -1,11 +1,11 @@
 # Hermes Bot - Roadmap
 
 > Auto-updated by MAIN after every hand-off and every completed task.
-> Last updated: 2026-06-19T21:34:31+03:00
+> Last updated: 2026-06-19T23:02:48+03:00
 
 ## Current Phase
 
-Phase 4 - GitHub Actions gates are ready for PR approval.
+Phase 6 - Telegram bridge, mobile docs, and automation setup fallback are ready for PR approval.
 
 ## Development Plan
 
@@ -15,14 +15,15 @@ Phase 4 - GitHub Actions gates are ready for PR approval.
 - Phase 1 foundation merged to `main`.
 - Phase 2 skills library merged to `main`.
 - Phase 3 hooks and guard rails merged to `main`.
+- Phase 4 GitHub Actions gates merged to `main`.
 
 ### In Progress
 
-- Phase 4 GitHub Actions gates - owner: Hermes Bot MAIN / Orchestrator, branch: `codex/orchestration-ci-gates`, step 5/5, PR pending.
+- Phase 6 automations, Telegram bridge, and mobile docs - owner: Hermes Bot MAIN / Orchestrator, branch: `codex/orchestration-phase6-telegram-automations`, step 6/7, PR pending. Telegram escalation live test passed; Codex automation API fallback requires UI setup.
 
 ### Queued
 
-- Phase 6 automations, Telegram bridge, and mobile docs - owner: Hermes Bot MAIN / Orchestrator, priority: high.
+- None.
 
 ### Future
 

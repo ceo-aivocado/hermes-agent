@@ -39,6 +39,9 @@ import tempfile
 import threading
 import time
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -5469,6 +5472,148 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             / "google_api.py"
         )
 
+    @staticmethod
+    def _source_sheet_http_timeout_seconds() -> float:
+        raw = os.getenv("HERMES_SOURCE_SHEET_HTTP_TIMEOUT_SECONDS", "20")
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            return 20.0
+
+    @staticmethod
+    def _source_sheet_mcp_token_names() -> list[str]:
+        raw = os.getenv("HERMES_SOURCE_GOOGLE_MCP_TOKEN_NAMES", "")
+        if raw.strip():
+            return [part.strip() for part in raw.split(",") if part.strip()]
+        return [
+            "google-workspace",
+            "google_workspace",
+            "google",
+            "google-drive",
+            "google_drive",
+            "gdrive",
+            "workspace",
+        ]
+
+    @staticmethod
+    def _source_sheet_token_has_spreadsheets_scope(payload: dict[str, Any]) -> bool:
+        scopes: list[str] = []
+        for key in ("scope", "scopes"):
+            raw = payload.get(key)
+            if isinstance(raw, str):
+                scopes.extend(part.strip() for part in raw.split() if part.strip())
+            elif isinstance(raw, list):
+                scopes.extend(str(part).strip() for part in raw if str(part).strip())
+        return "https://www.googleapis.com/auth/spreadsheets" in scopes
+
+    @staticmethod
+    def _source_sheet_mcp_token_is_fresh(payload: dict[str, Any], path: Path) -> bool:
+        expires_at = payload.get("expires_at")
+        if expires_at is not None:
+            try:
+                return float(expires_at) > time.time() + 60.0
+            except (TypeError, ValueError):
+                return False
+        expires_in = payload.get("expires_in")
+        if expires_in is not None:
+            try:
+                return path.stat().st_mtime + float(expires_in) > time.time() + 60.0
+            except (OSError, TypeError, ValueError):
+                return False
+        return True
+
+    @classmethod
+    def _source_sheet_mcp_access_token(cls) -> str:
+        token_dir = _hermes_home / "mcp-tokens"
+        if not token_dir.exists():
+            return ""
+
+        preferred = []
+        for name in cls._source_sheet_mcp_token_names():
+            safe = re.sub(r"[^\w\-]", "_", name).strip("_")[:128] or "default"
+            if safe:
+                preferred.append(token_dir / f"{safe}.json")
+        all_tokens = sorted(
+            path for path in token_dir.glob("*.json")
+            if not path.name.endswith((".client.json", ".meta.json"))
+        )
+        candidates = list(dict.fromkeys([*preferred, *all_tokens]))
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            token = str(payload.get("access_token") or "").strip()
+            if not token:
+                continue
+            if not cls._source_sheet_token_has_spreadsheets_scope(payload):
+                continue
+            if not cls._source_sheet_mcp_token_is_fresh(payload, path):
+                continue
+            return token
+        return ""
+
+    def _append_source_sheet_with_access_token_sync(
+        self,
+        record: dict[str, Any],
+        *,
+        access_token: str,
+    ) -> dict[str, Any]:
+        from gateway.source_ledger import build_source_sheet_row
+
+        sheet_id = self._source_sheet_id()
+        range_value = self._source_sheet_range()
+        encoded_range = urllib.parse.quote(range_value, safe="")
+        query = urllib.parse.urlencode({
+            "valueInputOption": "USER_ENTERED",
+            "insertDataOption": "INSERT_ROWS",
+        })
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(sheet_id, safe='')}"
+            f"/values/{encoded_range}:append?{query}"
+        )
+        body = json.dumps(
+            {"values": [build_source_sheet_row(record)]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self._source_sheet_http_timeout_seconds(),
+            ) as response:
+                response_text = response.read().decode("utf-8", errors="replace")
+                status = int(getattr(response, "status", 200) or 200)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            return {
+                "status": "failed",
+                "returncode": exc.code,
+                "result": f"HTTP {exc.code}: {error_body}"[:500],
+            }
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return {"status": "failed", "returncode": 1, "result": str(exc)[:500]}
+
+        result_status = _google_sheet_tool_result_status(response_text)
+        succeeded = 200 <= status < 300 and result_status != "failed"
+        return {
+            "status": "succeeded" if succeeded else "failed",
+            "returncode": 0 if succeeded else status,
+            "result": response_text[:500],
+        }
+
     async def _append_source_sheet_outbox_record(self, record: dict[str, Any]) -> dict[str, Any]:
         from gateway.source_ledger import (
             build_source_sheet_row,
@@ -5486,6 +5631,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error="HERMES_SOURCE_SHEET_ID is not configured",
             )
             return {"source_id": source_id, "status": "blocked", "error": "config_missing"}
+
+        mcp_access_token = self._source_sheet_mcp_access_token()
+        if mcp_access_token:
+            record_source_sheet_append_started(_hermes_home, record)
+            result = await asyncio.to_thread(
+                self._append_source_sheet_with_access_token_sync,
+                record,
+                access_token=mcp_access_token,
+            )
+            succeeded = str(result.get("status") or "") == "succeeded"
+            record_source_sheet_append_result(
+                _hermes_home,
+                record,
+                succeeded=succeeded,
+                error="" if succeeded else str(result.get("result") or ""),
+            )
+            return {
+                "source_id": source_id,
+                "status": "succeeded" if succeeded else "failed",
+                "returncode": result.get("returncode"),
+                "result": str(result.get("result") or "")[:500],
+            }
 
         script_path = self._google_workspace_api_script_path()
         if not script_path.exists():

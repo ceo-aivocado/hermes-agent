@@ -588,3 +588,38 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+    @pytest.mark.asyncio
+    async def test_aiva_orchestrator_approval_callback_posts_local_decision(self):
+        """AiVA approval cards should resolve in Telegram without opening a URL."""
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = "aiva_approval:approve:cbaa8aabf73e"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat.type = "supergroup"
+        query.message.message_thread_id = 99
+        query.from_user = MagicMock()
+        query.from_user.id = 10954083
+        query.from_user.first_name = "АЮ"
+        query.answer = AsyncMock()
+        query.edit_message_reply_markup = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "10954083"}):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                mock_response = MagicMock()
+                mock_response.__enter__.return_value.read.return_value = b'{"ok": true}'
+                mock_urlopen.return_value = mock_response
+
+                await adapter._handle_callback_query(update, context)
+
+        request = mock_urlopen.call_args[0][0]
+        assert request.full_url == "http://127.0.0.1:8765/approval/cbaa8aabf73e/approve"
+        query.answer.assert_called_once()
+        assert "Разрешено" in query.answer.call_args[1]["text"]
+        query.edit_message_reply_markup.assert_called_once_with(reply_markup=None)

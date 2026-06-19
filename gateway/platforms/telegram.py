@@ -16,6 +16,9 @@ import os
 import tempfile
 import html as _html
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -3764,6 +3767,66 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def _handle_aiva_orchestrator_approval_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        query_chat_id: Any = None,
+        query_chat_type: Any = None,
+        query_thread_id: Any = None,
+        query_user_name: Any = None,
+    ) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"approve", "deny"}:
+            await query.answer(text="Некорректная кнопка approval.")
+            return
+
+        decision = parts[1]
+        approval_id = parts[2]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", approval_id or ""):
+            await query.answer(text="Некорректный approval id.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ Нет права отвечать на этот approval.")
+            return
+
+        base_url = os.environ.get("AIVA_ORCHESTRATOR_URL", "http://127.0.0.1:8765").rstrip("/")
+        timeout = float(os.environ.get("AIVA_ORCHESTRATOR_APPROVAL_TIMEOUT", "5"))
+        url = (
+            f"{base_url}/approval/"
+            f"{urllib.parse.quote(approval_id, safe='')}/"
+            f"{decision}"
+        )
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+            payload = json.loads(body or "{}")
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            logger.warning("AiVA approval callback failed for %s: %s", approval_id, exc)
+            await query.answer(text="Не смог связаться с оркестратором.")
+            return
+
+        if not payload.get("ok"):
+            await query.answer(text="Approval уже обработан или не найден.")
+            return
+
+        label = "Разрешено. Codex продолжит." if decision == "approve" else "Отклонено."
+        await query.answer(text=label)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -3778,6 +3841,18 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- AiVA orchestrator approval callbacks (aiva_approval:approve|deny:<id>) ---
+        if data.startswith("aiva_approval:"):
+            await self._handle_aiva_orchestrator_approval_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):

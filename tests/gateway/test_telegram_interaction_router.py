@@ -59,7 +59,10 @@ def _user(user_id=111, name="Alice Example"):
     return SimpleNamespace(id=user_id, full_name=name, first_name=name.split()[0])
 
 
-def _group_text(text, *, chat_id=-100, user_id=111, entities=None):
+def _group_text(text, *, chat_id=-100, user_id=111, entities=None, reply_to_text=None):
+    reply_to_message = None
+    if reply_to_text is not None:
+        reply_to_message = SimpleNamespace(message_id=41, text=reply_to_text, caption=None)
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -70,7 +73,7 @@ def _group_text(text, *, chat_id=-100, user_id=111, entities=None):
         is_topic_message=False,
         chat=_chat(chat_id),
         from_user=_user(user_id),
-        reply_to_message=None,
+        reply_to_message=reply_to_message,
         date=None,
     )
 
@@ -201,6 +204,22 @@ def test_router_classifies_external_link_summary_request():
     adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
     text = "@hermes_bot https://example.com/article"
     msg = _group_text(text, entities=[_mention_entity(text)])
+
+    decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
+
+    assert decision.action == "dispatch"
+    assert decision.intent == "link_summary"
+    assert decision.reason == "external_link"
+
+
+def test_router_classifies_direct_mention_reply_to_external_link_as_link_summary_request():
+    adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+    text = "@hermes_bot сделай конспект"
+    msg = _group_text(
+        text,
+        entities=[_mention_entity(text)],
+        reply_to_text="https://example.com/article",
+    )
 
     decision = adapter._telegram_interaction_decision(msg, msg_type=MessageType.TEXT)
 

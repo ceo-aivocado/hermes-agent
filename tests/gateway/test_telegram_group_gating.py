@@ -93,6 +93,8 @@ def _group_message(
     from_user_name="Alice Example",
     thread_id=None,
     reply_to_bot=False,
+    reply_to_text=None,
+    reply_to_message_id=51,
     entities=None,
     caption=None,
     caption_entities=None,
@@ -100,6 +102,20 @@ def _group_message(
     reply_to_message = None
     if reply_to_bot:
         reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=10, text="previous bot reply", caption=None)
+    elif reply_to_text is not None:
+        reply_to_message = SimpleNamespace(
+            from_user=SimpleNamespace(id=222),
+            message_id=reply_to_message_id,
+            text=reply_to_text,
+            caption=None,
+            photo=None,
+            document=None,
+            video=None,
+            animation=None,
+            audio=None,
+            voice=None,
+            video_note=None,
+        )
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -187,6 +203,39 @@ def test_mentioned_youtube_link_is_enqueued_as_link_summary_workflow():
         assert "Google Sheet" in event.text
         assert "https://www.youtube.com/watch?v=8HjIfT2HYII4" in event.text
         assert "@hermes_bot" not in event.text
+
+    asyncio.run(_run())
+
+
+def test_mentioned_reply_to_youtube_link_is_enqueued_as_link_summary_workflow():
+    async def _run():
+        adapter = _make_adapter(require_mention=True, allowed_chats=["-100"])
+        captured = []
+        adapter._enqueue_text_event = captured.append
+        text = "@hermes_bot сделай конспект"
+        source_text = "https://www.youtube.com/watch?v=8HjIfT2HYII4"
+        update = SimpleNamespace(
+            update_id=1103,
+            message=_group_message(
+                text,
+                from_user_id=222,
+                from_user_name="Valery Pushkar",
+                entities=[_mention_entity(text)],
+                reply_to_text=source_text,
+                reply_to_message_id=2895,
+            ),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        assert len(captured) == 1
+        event = captured[0]
+        assert getattr(event, "telegram_interaction_intent", None) == "link_summary"
+        assert event.reply_to_text == source_text
+        assert event.reply_to_message_id == "2895"
+        assert getattr(event, "telegram_link_summary_requires_sheet_write", None) is True
+        assert "Telegram external link summary request" in event.text
 
     asyncio.run(_run())
 

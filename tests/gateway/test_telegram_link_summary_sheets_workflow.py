@@ -335,6 +335,124 @@ async def test_link_summary_does_not_warn_when_sheet_append_tool_call_exists(mon
 
 
 @pytest.mark.asyncio
+async def test_link_summary_video_attachment_is_analyzed_before_agent(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    video_path = tmp_path / "instagram-reel.mp4"
+    video_path.write_bytes(b"fake mp4")
+    event = _link_summary_event()
+    event.media_urls = [str(video_path)]
+    event.media_types = ["video/mp4"]
+    event.message_type = gateway_run.MessageType.VIDEO
+
+    video_calls = []
+
+    async def fake_video_analyze_tool(video_url, user_prompt, model=None):
+        video_calls.append((video_url, user_prompt, model))
+        return json.dumps(
+            {
+                "success": True,
+                "analysis": "В ролике показан AI workflow и шаги настройки оркестрации.",
+            }
+        )
+
+    monkeypatch.setattr("tools.vision_tools.video_analyze_tool", fake_video_analyze_tool)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Конспект готов и строка добавлена.",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_sheet",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "google_api.py sheets append",
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_sheet", "content": '{"status":"ok"}'},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        event.source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response == "Конспект готов и строка добавлена."
+    assert video_calls and video_calls[0][0] == str(video_path)
+    sent_message = runner._run_agent.await_args.kwargs["message"]
+    assert "Here's what I can extract from the attached video" in sent_message
+    assert "AI workflow" in sent_message
+    assert "instagram-reel.mp4" in sent_message
+
+
+@pytest.mark.asyncio
+async def test_link_summary_uses_observed_video_path_from_channel_context(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    video_path = tmp_path / "observed-instagram-reel.mp4"
+    video_path.write_bytes(b"fake mp4")
+    event = _link_summary_event()
+    event.channel_context = f"[Previous observed message]\n[video 'reel.mp4' saved at: {video_path}]"
+
+    video_calls = []
+
+    async def fake_video_analyze_tool(video_url, user_prompt, model=None):
+        video_calls.append(video_url)
+        return json.dumps(
+            {
+                "success": True,
+                "analysis": "Observed Reel shows a practical AI orchestration setup.",
+            }
+        )
+
+    monkeypatch.setattr("tools.vision_tools.video_analyze_tool", fake_video_analyze_tool)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Конспект готов и строка добавлена.",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_sheet",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": "google_api.py sheets append",
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_sheet", "content": '{"status":"ok"}'},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        event.source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response == "Конспект готов и строка добавлена."
+    assert video_calls == [str(video_path)]
+    sent_message = runner._run_agent.await_args.kwargs["message"]
+    assert "Observed Reel shows" in sent_message
+
+
+@pytest.mark.asyncio
 async def test_link_summary_keeps_sheet_failed_pending(monkeypatch, tmp_path):
     runner = _bootstrap_runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(

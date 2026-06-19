@@ -597,6 +597,11 @@ _GOOGLE_SHEET_FAILURE_STATUSES = frozenset({
     "forbidden",
 })
 
+_OBSERVED_VIDEO_PATH_RE = re.compile(
+    r"saved at:\s*(?P<path>(?:~?/|/)[^\]\n]+?\.(?:mp4|mov|webm|mkv|avi|mpeg|3gp))",
+    re.IGNORECASE,
+)
+
 
 def _stringify_for_gateway_audit(value: Any) -> str:
     if value is None:
@@ -747,6 +752,21 @@ def _append_google_sheet_missing_notice(response: str) -> str:
     if not body:
         return _GOOGLE_SHEET_MISSING_NOTICE
     return f"{body}\n\n{_GOOGLE_SHEET_MISSING_NOTICE}"
+
+
+def _observed_video_paths_from_text(text: str) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for match in _OBSERVED_VIDEO_PATH_RE.finditer(text or ""):
+        raw_path = match.group("path").strip().rstrip(".,;:)]}\"'")
+        expanded = os.path.expanduser(raw_path)
+        if not os.path.exists(expanded):
+            continue
+        if expanded in seen:
+            continue
+        seen.add(expanded)
+        paths.append(expanded)
+    return paths
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -9273,6 +9293,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             pass
 
+        if _event_requires_google_sheet_write(event):
+            for observed_path in _observed_video_paths_from_text(message_text):
+                if observed_path not in video_paths:
+                    video_paths.append(observed_path)
+
+        if video_paths and _event_requires_google_sheet_write(event):
+            message_text = await self._enrich_message_with_video_analysis(
+                message_text,
+                video_paths,
+            )
+
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
             for _apath in audio_file_paths:
@@ -13304,6 +13335,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"{prefix}\n\n{user_text}"
             return prefix
         return user_text
+
+    async def _enrich_message_with_video_analysis(
+        self,
+        user_text: str,
+        video_paths: List[str],
+    ) -> str:
+        """Auto-analyze attached source videos before link-summary dispatch."""
+        from agent.memory_manager import sanitize_context
+        from tools.credential_files import to_agent_visible_cache_path
+        from tools.vision_tools import video_analyze_tool
+
+        analysis_prompt = (
+            "This video was sent as a Telegram source for a concise synopsis. "
+            "Extract the useful content for an archivist: what happens, on-screen "
+            "text, spoken/visible claims, names/products mentioned, and the main "
+            "takeaway. Be concrete and do not rely on the original social URL."
+        )
+        enriched_parts: list[str] = []
+        for path in video_paths:
+            display = os.path.basename(path)
+            agent_path = to_agent_visible_cache_path(path)
+            try:
+                logger.debug("Auto-analyzing Telegram source video: %s", path)
+                result_json = await video_analyze_tool(
+                    video_url=path,
+                    user_prompt=analysis_prompt,
+                )
+                result = json.loads(result_json)
+                if result.get("success"):
+                    analysis = sanitize_context(str(result.get("analysis") or ""))
+                    enriched_parts.append(
+                        "[The user sent a video source attachment. "
+                        f"File: '{display}' at {agent_path}.\n"
+                        "Here's what I can extract from the attached video:\n"
+                        f"{analysis}\n"
+                        "Use this extracted video content for the synopsis if the "
+                        "external social URL is blocked or requires login.]"
+                    )
+                else:
+                    analysis = sanitize_context(str(result.get("analysis") or result.get("error") or ""))
+                    enriched_parts.append(
+                        "[The user sent a video source attachment, but automatic "
+                        f"video analysis failed for '{display}' at {agent_path}.\n"
+                        f"{analysis}\n"
+                        "Do not treat a blocked social URL as final if this local "
+                        "Telegram video can still be processed by another media tool.]"
+                    )
+            except Exception as exc:
+                logger.warning("Telegram source video analysis failed for %s: %s", path, exc)
+                enriched_parts.append(
+                    "[The user sent a video source attachment, but automatic "
+                    f"video analysis raised an error for '{display}' at {agent_path}: {exc}.\n"
+                    "Do not ask the user to resend until local media processing paths "
+                    "have been tried.]"
+                )
+
+        if not enriched_parts:
+            return user_text
+        prefix = "\n\n".join(enriched_parts)
+        if user_text:
+            return f"{prefix}\n\n{user_text}"
+        return prefix
 
     async def _enrich_message_with_transcription(
         self,

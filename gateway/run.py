@@ -5290,6 +5290,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
+        _recover_source_intake_on_gateway_startup()
+
         # Suspend sessions that were active when the gateway last exited.
         # This prevents stuck sessions from being blindly resumed on restart,
         # which can create an unrecoverable loop (#7536).  Suspended sessions
@@ -16766,6 +16768,25 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
         stop_event.wait(timeout=interval)
     logger.info("Cron ticker stopped")
+
+
+def _recover_source_intake_on_gateway_startup() -> dict[str, int]:
+    try:
+        from gateway.source_ledger import recover_source_intake_pending
+
+        summary = recover_source_intake_pending(_hermes_home)
+    except Exception as exc:
+        logger.warning("Source intake startup recovery failed: %s", exc)
+        return {"sources_seen": 0, "repaired_outbox": 0, "recovery_required": 0}
+
+    if summary.get("repaired_outbox") or summary.get("recovery_required"):
+        logger.info(
+            "Source intake startup recovery: sources=%d repaired_outbox=%d recovery_required=%d",
+            summary.get("sources_seen", 0),
+            summary.get("repaired_outbox", 0),
+            summary.get("recovery_required", 0),
+        )
+    return summary
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:

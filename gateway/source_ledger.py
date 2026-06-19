@@ -101,10 +101,10 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
-def _existing_source_ids(path: Path, *, event_name: str = "source_discovered") -> set[str]:
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
-        return set()
-    existing: set[str] = set()
+        return []
+    rows: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -112,6 +112,14 @@ def _existing_source_ids(path: Path, *, event_name: str = "source_discovered") -
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _existing_source_ids(path: Path, *, event_name: str = "source_discovered") -> set[str]:
+    existing: set[str] = set()
+    for row in _read_jsonl(path):
         source_id = str(row.get("source_id") or "")
         if source_id and row.get("event") == event_name:
             existing.add(source_id)
@@ -228,3 +236,91 @@ def record_link_summary_result(
         ],
     )
     return None
+
+
+def recover_source_intake_pending(hermes_home: Path) -> dict[str, int]:
+    """Repair and mark unfinished source intake rows after gateway restart."""
+    intake_dir = source_intake_dir(hermes_home)
+    ledger_path = intake_dir / "source_ledger.jsonl"
+    outbox_path = intake_dir / "sheet_outbox.jsonl"
+    ledger_rows = _read_jsonl(ledger_path)
+    outbox_rows = _read_jsonl(outbox_path)
+
+    discovered_by_id: dict[str, dict[str, Any]] = {}
+    latest_source_row_by_id: dict[str, dict[str, Any]] = {}
+    recovery_keys: set[tuple[str, str]] = set()
+    for row in ledger_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id:
+            continue
+        event_name = row.get("event")
+        if event_name == "source_discovered" and source_id not in discovered_by_id:
+            discovered_by_id[source_id] = row
+        if event_name != "recovery_required":
+            latest_source_row_by_id[source_id] = row
+        else:
+            reason = str(row.get("recovery_reason") or "")
+            if reason:
+                recovery_keys.add((source_id, reason))
+
+    outbox_events_by_id: dict[str, set[str]] = {}
+    pending_outbox_ids: set[str] = set()
+    attempted_outbox_ids: set[str] = set()
+    for row in outbox_rows:
+        source_id = str(row.get("source_id") or "")
+        if not source_id:
+            continue
+        event_name = str(row.get("event") or "")
+        outbox_events_by_id.setdefault(source_id, set()).add(event_name)
+        if row.get("status") == "pending":
+            pending_outbox_ids.add(source_id)
+        if row.get("status") == "attempted" or event_name == "sheet_write_attempted":
+            attempted_outbox_ids.add(source_id)
+
+    created_at = _now_iso()
+    repaired_outbox_rows: list[dict[str, Any]] = []
+    recovery_rows: list[dict[str, Any]] = []
+    for source_id, discovered in discovered_by_id.items():
+        if "sheet_write_required" not in outbox_events_by_id.get(source_id, set()):
+            repaired_outbox_rows.append(
+                {
+                    "event": "sheet_write_required",
+                    "status": "pending",
+                    "source_id": source_id,
+                    "url_or_ref": discovered.get("url_or_ref", ""),
+                    "created_at": created_at,
+                }
+            )
+            pending_outbox_ids.add(source_id)
+
+        latest = latest_source_row_by_id.get(source_id) or discovered
+        latest_event = latest.get("event")
+        sheet_status = latest.get("sheet_status")
+        reason = ""
+        if source_id not in attempted_outbox_ids:
+            if latest_event in {"source_discovered", "processing"}:
+                reason = "source_processing_incomplete"
+            elif sheet_status == "pending" or source_id in pending_outbox_ids:
+                reason = "sheet_write_pending"
+        if not reason or (source_id, reason) in recovery_keys:
+            continue
+        recovery_rows.append(
+            {
+                **discovered,
+                "event": "recovery_required",
+                "status": "recovery_pending",
+                "sheet_status": "pending",
+                "created_at": created_at,
+                "done": False,
+                "recovery_reason": reason,
+            }
+        )
+        recovery_keys.add((source_id, reason))
+
+    _append_jsonl(outbox_path, repaired_outbox_rows)
+    _append_jsonl(ledger_path, recovery_rows)
+    return {
+        "sources_seen": len(discovered_by_id),
+        "repaired_outbox": len(repaired_outbox_rows),
+        "recovery_required": len(recovery_rows),
+    }

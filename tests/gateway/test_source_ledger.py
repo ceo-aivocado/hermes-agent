@@ -1,9 +1,11 @@
 import json
 
+import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 from gateway.source_ledger import (
+    recover_source_intake_pending,
     record_link_summary_result,
     record_link_summary_sources,
     source_intake_dir,
@@ -173,3 +175,91 @@ def test_record_link_summary_result_marks_sheet_attempt_without_done(tmp_path):
     assert outbox_rows[-1]["event"] == "sheet_write_attempted"
     assert outbox_rows[-1]["source_id"] == records[0]["source_id"]
     assert outbox_rows[-1]["status"] == "attempted"
+
+
+def test_recover_source_intake_repairs_missing_outbox_after_restart(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+    intake_dir = source_intake_dir(tmp_path)
+    outbox_path = intake_dir / "sheet_outbox.jsonl"
+    outbox_path.unlink()
+
+    summary = recover_source_intake_pending(tmp_path)
+
+    assert summary["repaired_outbox"] == 1
+    assert summary["recovery_required"] == 1
+
+    outbox_rows = _read_jsonl(outbox_path)
+    assert [row["event"] for row in outbox_rows] == ["sheet_write_required"]
+    assert outbox_rows[0]["source_id"] == records[0]["source_id"]
+
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "recovery_required"
+    assert ledger_rows[-1]["source_id"] == records[0]["source_id"]
+    assert ledger_rows[-1]["status"] == "recovery_pending"
+    assert ledger_rows[-1]["recovery_reason"] == "source_processing_incomplete"
+
+
+def test_recover_source_intake_marks_pending_sheet_write_after_restart(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    records = record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+
+    summary = recover_source_intake_pending(tmp_path)
+
+    assert summary["repaired_outbox"] == 0
+    assert summary["recovery_required"] == 1
+
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "recovery_required"
+    assert ledger_rows[-1]["source_id"] == records[0]["source_id"]
+    assert ledger_rows[-1]["status"] == "recovery_pending"
+    assert ledger_rows[-1]["recovery_reason"] == "sheet_write_pending"
+
+
+def test_recover_source_intake_is_idempotent(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+
+    first = recover_source_intake_pending(tmp_path)
+    second = recover_source_intake_pending(tmp_path)
+
+    assert first["recovery_required"] == 1
+    assert second["recovery_required"] == 0
+
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    recovery_rows = [row for row in ledger_rows if row["event"] == "recovery_required"]
+    assert len(recovery_rows) == 1
+
+
+def test_gateway_startup_recovery_sweeps_source_intake(monkeypatch, tmp_path):
+    event = _link_summary_event("https://example.com/source")
+    record_link_summary_sources(tmp_path, event)
+    record_link_summary_result(
+        tmp_path,
+        event,
+        response_text="Конспект готов.",
+        sheet_write_attempted=False,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    summary = gateway_run._recover_source_intake_on_gateway_startup()
+
+    assert summary["recovery_required"] == 1
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    assert ledger_rows[-1]["event"] == "recovery_required"
+    assert ledger_rows[-1]["recovery_reason"] == "sheet_write_pending"

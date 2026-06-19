@@ -5278,6 +5278,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             record_source_replay_started,
         )
 
+        outbox_summary = {
+            "queued": 0,
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "blocked": 0,
+        }
+        if self._source_sheet_id():
+            outbox_summary = await self._complete_source_sheet_outbox_pending(limit=limit)
+
         records = pending_source_replay_records(
             _hermes_home,
             limit=limit,
@@ -5286,6 +5296,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         summary = {
             "queued": len(records),
             "attempted": 0,
+            "sheet_outbox_queued": outbox_summary["queued"],
+            "sheet_outbox_attempted": outbox_summary["attempted"],
+            "sheet_outbox_succeeded": outbox_summary["succeeded"],
+            "sheet_outbox_failed": outbox_summary["failed"],
+            "sheet_outbox_blocked": outbox_summary["blocked"],
             "sheet_write_attempted": 0,
             "sheet_write_succeeded": 0,
             "sheet_write_failed": 0,
@@ -5421,6 +5436,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
         self._last_source_replay_sweep_ts = now_ts
         return self._schedule_source_intake_replay()
+
+    @staticmethod
+    def _source_sheet_id() -> str:
+        return os.getenv("HERMES_SOURCE_SHEET_ID", "").strip()
+
+    @staticmethod
+    def _source_sheet_range() -> str:
+        return os.getenv("HERMES_SOURCE_SHEET_RANGE", "Sheet1!A:I").strip() or "Sheet1!A:I"
+
+    @staticmethod
+    def _google_workspace_api_script_path() -> Path:
+        configured = os.getenv("HERMES_GOOGLE_API_SCRIPT", "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        home_script = (
+            _hermes_home
+            / "skills"
+            / "productivity"
+            / "google-workspace"
+            / "scripts"
+            / "google_api.py"
+        )
+        if home_script.exists():
+            return home_script
+        return (
+            Path(__file__).resolve().parent.parent
+            / "skills"
+            / "productivity"
+            / "google-workspace"
+            / "scripts"
+            / "google_api.py"
+        )
+
+    async def _append_source_sheet_outbox_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        from gateway.source_ledger import (
+            build_source_sheet_row,
+            record_source_sheet_append_result,
+            record_source_sheet_append_started,
+        )
+
+        source_id = str(record.get("source_id") or "")
+        sheet_id = self._source_sheet_id()
+        if not sheet_id:
+            record_source_sheet_append_result(
+                _hermes_home,
+                record,
+                blocked=True,
+                error="HERMES_SOURCE_SHEET_ID is not configured",
+            )
+            return {"source_id": source_id, "status": "blocked", "error": "config_missing"}
+
+        script_path = self._google_workspace_api_script_path()
+        if not script_path.exists():
+            record_source_sheet_append_result(
+                _hermes_home,
+                record,
+                blocked=True,
+                error=f"google_api.py not found: {script_path}",
+            )
+            return {"source_id": source_id, "status": "blocked", "error": "script_missing"}
+
+        record_source_sheet_append_started(_hermes_home, record)
+        values = json.dumps([build_source_sheet_row(record)], ensure_ascii=False)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script_path),
+            "sheets",
+            "append",
+            sheet_id,
+            self._source_sheet_range(),
+            "--values",
+            values,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await proc.communicate()
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        result_text = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+        result_status = _google_sheet_tool_result_status(result_text)
+        succeeded = proc.returncode == 0 and result_status != "failed"
+        record_source_sheet_append_result(
+            _hermes_home,
+            record,
+            succeeded=succeeded,
+            error="" if succeeded else result_text,
+        )
+        return {
+            "source_id": source_id,
+            "status": "succeeded" if succeeded else "failed",
+            "returncode": proc.returncode,
+            "result": result_text[:500],
+        }
+
+    async def _complete_source_sheet_outbox_pending(self, *, limit: int = 3) -> dict[str, int]:
+        from gateway.source_ledger import pending_source_sheet_outbox_records
+
+        records = pending_source_sheet_outbox_records(_hermes_home, limit=limit)
+        summary = {
+            "queued": len(records),
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "blocked": 0,
+        }
+        for record in records:
+            summary["attempted"] += 1
+            try:
+                result = await self._append_source_sheet_outbox_record(record)
+            except Exception as exc:
+                from gateway.source_ledger import record_source_sheet_append_result
+
+                record_source_sheet_append_result(_hermes_home, record, error=str(exc))
+                result = {"status": "failed"}
+            status = str(result.get("status") or "")
+            if status == "succeeded":
+                summary["succeeded"] += 1
+            elif status == "blocked":
+                summary["blocked"] += 1
+            else:
+                summary["failed"] += 1
+        if summary["attempted"]:
+            logger.info(
+                "Source Sheet outbox completion: queued=%d attempted=%d succeeded=%d failed=%d blocked=%d",
+                summary["queued"],
+                summary["attempted"],
+                summary["succeeded"],
+                summary["failed"],
+                summary["blocked"],
+            )
+        return summary
 
     async def start(self) -> bool:
         """

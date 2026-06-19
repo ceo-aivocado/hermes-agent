@@ -158,7 +158,43 @@ async def test_link_summary_surfaces_missing_google_sheet_write(monkeypatch, tmp
 
     assert response is not None
     assert "Конспект готов." in response
-    assert "Google Sheet write was not confirmed" in response
+    assert "База: запись в Google Sheet не подтверждена" in response
+    assert "Google Sheet write was not confirmed" not in response
+
+
+@pytest.mark.asyncio
+async def test_link_summary_does_not_duplicate_agent_visible_sheet_auth_block(monkeypatch, tmp_path):
+    runner = _bootstrap_runner(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": (
+                "Конспект готов.\n\n"
+                "⚠️ KB/Sheet\n"
+                "Google-авторизация не настроена — запись в Knowledge Base пропущена. "
+                "Когда настроим — догоним backlog."
+            ),
+            "messages": [
+                {"role": "user", "content": "summarize url"},
+                {"role": "assistant", "content": "Конспект готов. Google-авторизация не настроена."},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _link_summary_event(),
+        _link_summary_event().source,
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response is not None
+    assert response.count("KB/Sheet") == 1
+    assert "Google-авторизация не настроена" in response
+    assert "Google Sheet write was not confirmed" not in response
+    assert "База: запись в Google Sheet не подтверждена" not in response
 
 
 @pytest.mark.asyncio

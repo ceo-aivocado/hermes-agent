@@ -193,6 +193,16 @@ _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]{20,}\b"),
 )
 
+_TELEGRAM_INTERNAL_TOOL_DIAGNOSTIC_RE = re.compile(
+    r"(firecrawl|web_search|youtube\s+transcript\s+api|ip\s+заблокирован|кредиты\s+исчерпаны)",
+    re.IGNORECASE,
+)
+
+_TELEGRAM_EXTERNAL_CHECK_UNAVAILABLE_NOTICE = (
+    "⚠️ Внешняя проверка источников сейчас недоступна. Могу дать предварительную "
+    "оценку по содержанию и вернуться к полной проверке, когда инструменты восстановятся."
+)
+
 
 def _ensure_windows_gateway_venv_imports() -> None:
     """Make detached Windows gateway runs see the Hermes venv packages.
@@ -480,6 +490,47 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+def _telegram_line_has_internal_tool_diagnostic(line: str) -> bool:
+    return bool(_TELEGRAM_INTERNAL_TOOL_DIAGNOSTIC_RE.search(str(line or "")))
+
+
+def _sanitize_telegram_internal_tool_diagnostics(text: str) -> str:
+    """Keep raw tool/provider diagnostics out of public Telegram replies."""
+    lines = str(text or "").splitlines()
+    if not any(_telegram_line_has_internal_tool_diagnostic(line) for line in lines):
+        return text
+
+    out: list[str] = []
+    notice_inserted = False
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip().lower()
+        if stripped == "что сейчас недоступно:":
+            next_idx = idx + 1
+            while next_idx < len(lines) and not lines[next_idx].strip():
+                next_idx += 1
+            if (
+                next_idx < len(lines)
+                and _telegram_line_has_internal_tool_diagnostic(lines[next_idx])
+            ):
+                if not notice_inserted:
+                    out.append(_TELEGRAM_EXTERNAL_CHECK_UNAVAILABLE_NOTICE)
+                    notice_inserted = True
+                idx += 1
+                continue
+        if _telegram_line_has_internal_tool_diagnostic(line):
+            if not notice_inserted:
+                out.append(_TELEGRAM_EXTERNAL_CHECK_UNAVAILABLE_NOTICE)
+                notice_inserted = True
+            idx += 1
+            continue
+        out.append(line)
+        idx += 1
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to high-noise chats.
 
@@ -495,7 +546,7 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
-    return redacted
+    return _sanitize_telegram_internal_tool_diagnostics(redacted)
 
 
 _GOOGLE_SHEET_WRITE_NAME_RE = re.compile(
@@ -513,8 +564,16 @@ _GOOGLE_SHEET_WRITE_ARGS_RE = re.compile(
 )
 
 _GOOGLE_SHEET_MISSING_NOTICE = (
-    "⚠️ Google Sheet write was not confirmed. The source was summarized, "
-    "but no Sheets append/update tool call was observed."
+    "⚠️ База: запись в Google Sheet не подтверждена. Конспект создан, "
+    "но строка в таблице не была записана."
+)
+
+_GOOGLE_SHEET_VISIBLE_STATUS_RE = re.compile(
+    r"(Google[-\s]?авторизац|Knowledge\s+Base.{0,80}(пропущ|очеред|backlog)"
+    r"|KB/Sheet|База:.{0,120}(очеред|авторизац|не\s+подтвержд|пропущ|запис)"
+    r"|Google\s+Sheet\s+write\s+was\s+not\s+confirmed"
+    r"|Sheets\s+append/update\s+tool\s+call)",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -566,7 +625,7 @@ def _event_requires_google_sheet_write(event: Any) -> bool:
 
 def _append_google_sheet_missing_notice(response: str) -> str:
     body = str(response or "").rstrip()
-    if _GOOGLE_SHEET_MISSING_NOTICE in body:
+    if _GOOGLE_SHEET_MISSING_NOTICE in body or _GOOGLE_SHEET_VISIBLE_STATUS_RE.search(body):
         return body
     if not body:
         return _GOOGLE_SHEET_MISSING_NOTICE

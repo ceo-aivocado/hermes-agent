@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Conflict Detector"
+  short_description: "Detect roadmap contradictions"
+  default_prompt: "Check this instruction for conflicts"

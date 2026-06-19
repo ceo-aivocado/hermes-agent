@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Telegram Escalation"
+  short_description: "Escalate only policy triggers"
+  default_prompt: "Escalate this blocker to АЮ"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Merge Coordinator"
+  short_description: "Order ready PR merges safely"
+  default_prompt: "Plan merge order for ready PRs"

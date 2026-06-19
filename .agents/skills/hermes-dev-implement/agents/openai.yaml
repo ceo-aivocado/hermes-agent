@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Dev Implement"
+  short_description: "Implement a spec by domain"
+  default_prompt: "Implement this Hermes Bot spec"

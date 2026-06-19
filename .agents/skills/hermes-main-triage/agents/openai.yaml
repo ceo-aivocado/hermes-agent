@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes MAIN Triage"
+  short_description: "Classify and route АЮ tasks"
+  default_prompt: "Triage these Hermes Bot tasks"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes QA Bug Intake"
+  short_description: "Turn bug reports into issues"
+  default_prompt: "Create a structured bug issue"

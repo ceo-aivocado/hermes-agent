@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes PM Self Review"
+  short_description: "Check spec quality before handoff"
+  default_prompt: "Review this spec before handoff"

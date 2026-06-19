@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Domain Guard"
+  short_description: "Check Developer domain ownership"
+  default_prompt: "Check this edit against domain ownership"

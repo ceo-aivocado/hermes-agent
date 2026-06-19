@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes QA Fix"
+  short_description: "Fix a triaged bug with regression test"
+  default_prompt: "Fix this triaged bug"

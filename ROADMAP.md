@@ -36,6 +36,7 @@ Phase 4 - GitHub Actions gates are ready for PR approval.
 ## Active Blockers
 
 - None.
+- Manual ROADMAP consistency negative test - should be rejected by CI.
 
 ## Metrics (last 7 days)
 

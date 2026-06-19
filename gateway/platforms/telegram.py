@@ -5455,7 +5455,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _contains_telegram_internal_message_link(text: str) -> bool:
         return bool(re.search(r"(?i)https?://t\.me/(?:c/\d+/\d+|[A-Za-z0-9_]+/\d+)\b", text or ""))
 
-    def _is_aivocado_link_request(self, message: Any) -> bool:
+    def _message_has_aivocado_external_source(self, message: Any) -> bool:
         """Return True for external links/videos that should be summarized.
 
         Telegram message permalinks point to chat history, not an external
@@ -5478,6 +5478,13 @@ class TelegramAdapter(BasePlatformAdapter):
         document = getattr(message, "document", None)
         mime_type = str(getattr(document, "mime_type", "") or "") if document else ""
         return mime_type.startswith("video/")
+
+    def _is_aivocado_link_request(self, message: Any) -> bool:
+        return self._message_has_aivocado_external_source(message)
+
+    def _is_aivocado_replied_link_request(self, message: Any) -> bool:
+        reply_msg = getattr(message, "reply_to_message", None)
+        return bool(reply_msg and self._message_has_aivocado_external_source(reply_msg))
 
     @staticmethod
     def _telegram_message_text(message: Message) -> str:
@@ -5564,6 +5571,8 @@ class TelegramAdapter(BasePlatformAdapter):
         text = self._telegram_message_text(message)
         if self._contains_telegram_internal_message_link(text):
             return TelegramInteractionDecision("dispatch", "telegram_message_link", "telegram_internal_link", msg_type)
+        if self._is_aivocado_replied_link_request(message):
+            return TelegramInteractionDecision("dispatch", "link_summary", "external_link", msg_type)
         if self._is_aivocado_link_request(message):
             return TelegramInteractionDecision("dispatch", "link_summary", "external_link", msg_type)
 

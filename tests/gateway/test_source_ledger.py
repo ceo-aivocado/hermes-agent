@@ -31,6 +31,14 @@ def _link_summary_event(text: str) -> MessageEvent:
     return event
 
 
+def _reply_link_summary_event(text: str, reply_to_text: str) -> MessageEvent:
+    event = _link_summary_event(text)
+    event.message_id = "trigger-43"
+    event.reply_to_message_id = "source-7"
+    event.reply_to_text = reply_to_text
+    return event
+
+
 def test_record_link_summary_sources_writes_ledger_and_sheet_outbox(tmp_path):
     event = _link_summary_event(
         "Please process https://youtu.be/abc123 and https://example.com/a?x=1. "
@@ -60,6 +68,39 @@ def test_record_link_summary_sources_writes_ledger_and_sheet_outbox(tmp_path):
     assert [row["event"] for row in outbox_rows] == ["sheet_write_required", "sheet_write_required"]
     assert {row["status"] for row in outbox_rows} == {"pending"}
     assert {row["source_id"] for row in outbox_rows} == {record["source_id"] for record in records}
+
+
+def test_record_link_summary_sources_is_idempotent_for_duplicate_source(tmp_path):
+    event = _link_summary_event("https://example.com/source")
+
+    first = record_link_summary_sources(tmp_path, event)
+    second = record_link_summary_sources(tmp_path, event)
+
+    assert first[0]["source_id"] == second[0]["source_id"]
+
+    intake_dir = source_intake_dir(tmp_path)
+    ledger_rows = _read_jsonl(intake_dir / "source_ledger.jsonl")
+    assert [row["event"] for row in ledger_rows] == ["source_discovered"]
+
+    outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
+    assert [row["event"] for row in outbox_rows] == ["sheet_write_required"]
+
+
+def test_reply_to_source_uses_replied_message_as_source_identity(tmp_path):
+    original = _link_summary_event("https://example.com/source")
+    original.message_id = "source-7"
+    reply = _reply_link_summary_event("@AiVocadoHermes_bot сделай конспект", "https://example.com/source")
+
+    original_records = record_link_summary_sources(tmp_path, original)
+    reply_records = record_link_summary_sources(tmp_path, reply)
+
+    assert reply_records[0]["source_id"] == original_records[0]["source_id"]
+    assert reply_records[0]["message_id"] == "source-7"
+    assert reply_records[0]["trigger_message_id"] == "trigger-43"
+
+    intake_dir = source_intake_dir(tmp_path)
+    outbox_rows = _read_jsonl(intake_dir / "sheet_outbox.jsonl")
+    assert [row["event"] for row in outbox_rows] == ["sheet_write_required"]
 
 
 def test_record_link_summary_result_keeps_sheet_pending_when_write_missing(tmp_path):

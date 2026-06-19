@@ -6884,6 +6884,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         return True
 
+    @staticmethod
+    def _telegram_exec_approval_thread_key(thread_id: Optional[str]) -> str:
+        """Normalize Telegram General-topic routing for approval target checks."""
+        if thread_id is None:
+            return ""
+        value = str(thread_id).strip()
+        return "" if value in {"", "1"} else value
+
     def _exec_approval_delivery_target(
         self,
         source,
@@ -6901,21 +6909,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         platform = getattr(source, "platform", None)
         if platform == Platform.TELEGRAM:
+            source_chat_type = str(getattr(source, "chat_type", "") or "").lower()
+            requires_operator_target = source_chat_type != "dm"
             config = getattr(self, "config", None)
             home = config.get_home_channel(platform) if config and hasattr(config, "get_home_channel") else None
             home_chat_id = getattr(home, "chat_id", None)
             if isinstance(home_chat_id, (str, int)) and str(home_chat_id).strip():
                 chat_id = str(home_chat_id)
+                home_thread_id = getattr(home, "thread_id", None)
+                if requires_operator_target:
+                    source_chat_id = str(getattr(source, "chat_id", "") or "")
+                    same_chat = chat_id == source_chat_id
+                    same_thread = (
+                        self._telegram_exec_approval_thread_key(home_thread_id)
+                        == self._telegram_exec_approval_thread_key(getattr(source, "thread_id", None))
+                    )
+                    if same_chat and same_thread:
+                        raise RuntimeError(
+                            "Telegram dangerous-command approval requires a distinct "
+                            "operator home channel."
+                        )
                 try:
                     metadata = self._thread_metadata_for_target(
                         platform,
                         chat_id,
-                        getattr(home, "thread_id", None),
+                        home_thread_id,
                         adapter=adapter,
                     )
                 except Exception:
                     metadata = None
                 return chat_id, metadata
+
+            if requires_operator_target:
+                raise RuntimeError(
+                    "Telegram dangerous-command approval requires a configured "
+                    "operator home channel."
+                )
 
         return str(fallback_chat_id), fallback_metadata
 

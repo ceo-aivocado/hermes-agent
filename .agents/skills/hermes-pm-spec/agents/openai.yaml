@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes PM Spec"
+  short_description: "Turn ideas into dev specs"
+  default_prompt: "Draft a Developer-ready spec"

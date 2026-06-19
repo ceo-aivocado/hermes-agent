@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Research Memo"
+  short_description: "Research and recommend one path"
+  default_prompt: "Research this decision and recommend one path"

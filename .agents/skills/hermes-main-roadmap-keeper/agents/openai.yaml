@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hermes Roadmap Keeper"
+  short_description: "Update ROADMAP status safely"
+  default_prompt: "Update ROADMAP for this state change"

@@ -187,6 +187,10 @@ _PROVIDER_DISPLAY_NAMES = {
     "openai-codex": "OpenAI Codex",
 }
 
+_OWNER_PROVIDER_CREDIT_ALERT_KEY = "provider.credit_alert"
+_OWNER_PROVIDER_CREDIT_ALERT_THROTTLE_SECONDS = 24 * 60 * 60
+_OWNER_PROVIDER_CREDIT_ALERT_THROTTLE_FILE = "provider_credit_alert_throttle.json"
+
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
@@ -439,6 +443,44 @@ def _provider_display_name(provider: Any) -> str:
         normalized,
         normalized.replace("_", " ").replace("-", " ").title(),
     )
+
+
+def _owner_provider_credit_alert_throttle_path() -> Path:
+    return _hermes_home / _OWNER_PROVIDER_CREDIT_ALERT_THROTTLE_FILE
+
+
+def _load_owner_provider_credit_alert_throttle() -> dict[str, float]:
+    path = _owner_provider_credit_alert_throttle_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.debug("Failed to read provider credit alert throttle", exc_info=True)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            result[str(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _store_owner_provider_credit_alert_throttle(records: dict[str, float]) -> None:
+    path = _owner_provider_credit_alert_throttle_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(records, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except Exception:
+        logger.debug("Failed to store provider credit alert throttle", exc_info=True)
 
 
 def _build_credit_monitor_notice(
@@ -7653,10 +7695,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Send provider billing/credits failures only to the owner home channel."""
         if not _looks_like_provider_billing_or_credits_error(raw_text):
             return False
-        key = "provider.billing_or_credits"
-        now = time.monotonic()
-        last_sent = self._owner_provider_alert_last_sent.get(key)
-        if last_sent is not None and now - last_sent < 900.0:
+        now = time.time()
+        if self._owner_provider_credit_alert_recently_sent(now):
             return False
 
         message = (
@@ -7665,9 +7705,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "was sanitized. Check OpenRouter/Firecrawl credits."
         )
         if await self._deliver_home_channel_notice(platform, message):
-            self._owner_provider_alert_last_sent[key] = now
+            self._record_owner_provider_credit_alert_sent(now)
             return True
         return False
+
+    def _owner_provider_credit_alert_recently_sent(self, now: float) -> bool:
+        key = _OWNER_PROVIDER_CREDIT_ALERT_KEY
+        last_sent = self._owner_provider_alert_last_sent.get(key)
+        durable_records = _load_owner_provider_credit_alert_throttle()
+        durable_last_sent = durable_records.get(key)
+        if durable_last_sent is not None and (
+            last_sent is None or durable_last_sent > last_sent
+        ):
+            last_sent = durable_last_sent
+            self._owner_provider_alert_last_sent[key] = durable_last_sent
+        if last_sent is None:
+            return False
+        return now - last_sent < _OWNER_PROVIDER_CREDIT_ALERT_THROTTLE_SECONDS
+
+    def _record_owner_provider_credit_alert_sent(self, now: float) -> None:
+        key = _OWNER_PROVIDER_CREDIT_ALERT_KEY
+        self._owner_provider_alert_last_sent[key] = now
+        records = _load_owner_provider_credit_alert_throttle()
+        records[key] = now
+        _store_owner_provider_credit_alert_throttle(records)
 
     def _credit_monitor_config(self) -> Optional[tuple[str, Platform, float, float, float]]:
         """Return the optional owner credit-monitor configuration."""
@@ -7734,7 +7795,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if previous == band:
             return
+        now = time.time()
+        if self._owner_provider_credit_alert_recently_sent(now):
+            return
         if await self._deliver_home_channel_notice(platform, message):
+            self._record_owner_provider_credit_alert_sent(now)
             self._credit_monitor_last_band_by_provider[key] = band
 
     async def _credits_monitor_watcher(self) -> None:

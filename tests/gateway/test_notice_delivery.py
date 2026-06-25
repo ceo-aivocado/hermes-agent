@@ -1,7 +1,9 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
@@ -74,6 +76,7 @@ def _make_telegram_runner(extra=None):
     adapter.send_private_notice = AsyncMock(return_value=SendResult(success=True, message_id="private-1"))
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._owner_provider_alert_last_sent = {}
+    runner._credit_monitor_last_band_by_provider = {}
     return runner, adapter
 
 
@@ -130,8 +133,9 @@ async def test_credit_notice_routes_to_telegram_home_channel_not_source_group():
 
 
 @pytest.mark.asyncio
-async def test_provider_billing_alert_routes_to_home_channel_not_source_group():
+async def test_provider_billing_alert_routes_to_home_channel_not_source_group(monkeypatch, tmp_path):
     runner, adapter = _make_telegram_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     await runner._send_owner_provider_billing_alert(
         Platform.TELEGRAM,
@@ -145,6 +149,81 @@ async def test_provider_billing_alert_routes_to_home_channel_not_source_group():
     assert "public chat was sanitized" in args[1].lower()
     assert "Error code" not in args[1]
     assert kwargs == {"metadata": {"thread_id": "777"}}
+
+
+@pytest.mark.asyncio
+async def test_provider_billing_alert_is_capped_to_one_per_day(monkeypatch, tmp_path):
+    runner, adapter = _make_telegram_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    now = {"epoch": 1_750_000_000.0, "monotonic": 10_000.0}
+    monkeypatch.setattr(gateway_run.time, "time", lambda: now["epoch"])
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: now["monotonic"])
+    message = "Billing or credits exhausted: Error code: 402 - This request requires more credits."
+
+    assert await runner._send_owner_provider_billing_alert(Platform.TELEGRAM, message) is True
+
+    now["epoch"] += 3600.0
+    now["monotonic"] += 3600.0
+
+    assert await runner._send_owner_provider_billing_alert(Platform.TELEGRAM, message) is False
+    assert adapter.send.await_count == 1
+
+    now["epoch"] += 24 * 60 * 60 + 1
+    now["monotonic"] += 24 * 60 * 60 + 1
+
+    assert await runner._send_owner_provider_billing_alert(Platform.TELEGRAM, message) is True
+    assert adapter.send.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_billing_alert_daily_cap_survives_runner_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    now = {"epoch": 1_750_000_000.0, "monotonic": 20_000.0}
+    monkeypatch.setattr(gateway_run.time, "time", lambda: now["epoch"])
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: now["monotonic"])
+    message = "Billing or credits exhausted: Error code: 402 - This request requires more credits."
+
+    runner, adapter = _make_telegram_runner()
+    assert await runner._send_owner_provider_billing_alert(Platform.TELEGRAM, message) is True
+    assert adapter.send.await_count == 1
+
+    now["epoch"] += 3600.0
+    now["monotonic"] += 3600.0
+    restarted_runner, restarted_adapter = _make_telegram_runner()
+
+    assert await restarted_runner._send_owner_provider_billing_alert(Platform.TELEGRAM, message) is False
+    restarted_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_billing_alert_daily_cap_also_suppresses_credit_monitor(monkeypatch, tmp_path):
+    runner, adapter = _make_telegram_runner()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    now = {"epoch": 1_750_000_000.0, "monotonic": 30_000.0}
+    monkeypatch.setattr(gateway_run.time, "time", lambda: now["epoch"])
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: now["monotonic"])
+    monkeypatch.setattr(
+        gateway_run,
+        "fetch_account_usage",
+        lambda provider: SimpleNamespace(
+            provider=provider,
+            details=("Credits balance: $2.50",),
+        ),
+    )
+    message = "Billing or credits exhausted: Error code: 402 - This request requires more credits."
+
+    assert await runner._send_owner_provider_billing_alert(Platform.TELEGRAM, message) is True
+
+    now["epoch"] += 3600.0
+    now["monotonic"] += 3600.0
+    await runner._run_credit_monitor_once(
+        "openrouter",
+        Platform.TELEGRAM,
+        low_usd=10.0,
+        critical_usd=3.0,
+    )
+
+    assert adapter.send.await_count == 1
 
 
 def test_exec_approval_target_routes_telegram_group_to_home_channel():

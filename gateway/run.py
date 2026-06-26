@@ -5511,6 +5511,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return os.getenv("HERMES_SOURCE_SHEET_RANGE", "Sheet1!A:I").strip() or "Sheet1!A:I"
 
     @staticmethod
+    def _task_intake_enabled() -> bool:
+        return os.getenv("TELEGRAM_TASK_INTAKE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _task_intake_chats() -> set[str]:
+        raw = os.getenv("TELEGRAM_TASK_INTAKE_CHATS", "").strip()
+        if not raw:
+            return set()
+        return {part.strip() for part in raw.split(",") if part.strip()}
+
+    @staticmethod
+    def _task_intake_markers() -> tuple[str, ...]:
+        raw = os.getenv("TELEGRAM_TASK_MARKERS", "").strip()
+        if not raw:
+            return ("задача", "task", "todo", "дело")
+        return tuple(part.strip().lstrip("#") for part in raw.split(",") if part.strip())
+
+    @staticmethod
+    def _task_sheet_id() -> str:
+        return (
+            os.getenv("TELEGRAM_TASK_SHEET_ID", "").strip()
+            or os.getenv("HERMES_TASK_SHEET_ID", "").strip()
+        )
+
+    @staticmethod
+    def _task_sheet_range() -> str:
+        configured = os.getenv("TELEGRAM_TASK_SHEET_RANGE", "").strip()
+        if configured:
+            return configured
+        tab = os.getenv("TELEGRAM_TASK_SHEET_TAB", "Tasks").strip() or "Tasks"
+        return f"{tab}!A:X"
+
+    @staticmethod
+    def _task_sheet_http_timeout_seconds() -> float:
+        raw = os.getenv("TELEGRAM_TASK_SHEET_HTTP_TIMEOUT_SECONDS", "").strip()
+        if not raw:
+            return GatewayRunner._source_sheet_http_timeout_seconds()
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            return 20.0
+
+    @staticmethod
     def _google_workspace_api_script_path() -> Path:
         configured = os.getenv("HERMES_GOOGLE_API_SCRIPT", "").strip()
         if configured:
@@ -5797,6 +5840,278 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return summary
 
+    @staticmethod
+    def _task_intake_chat_enabled(event: MessageEvent) -> bool:
+        chats = GatewayRunner._task_intake_chats()
+        if not chats:
+            return False
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        return "*" in chats or chat_id in chats
+
+    @staticmethod
+    def _task_intake_ack(record: Any, *, sheet_status: str) -> str:
+        if sheet_status != "succeeded":
+            return "Записал задачу, таблица временно недоступна, поставил в очередь."
+        assignee = str(getattr(record, "assignee", "") or "").strip()
+        category = str(getattr(record, "category", "") or "").strip()
+        status = str(getattr(record, "status", "") or "new").strip() or "new"
+        if not assignee:
+            return "Не понял исполнителя, записал задачу без исполнителя."
+        if category:
+            return f"Записал задачу: {assignee} / {category} / {status}."
+        return f"Записал задачу: {assignee} / {status}."
+
+    def _append_task_sheet_with_access_token_sync(
+        self,
+        record: dict[str, Any],
+        *,
+        access_token: str,
+    ) -> dict[str, Any]:
+        from gateway.task_sheet_writer import build_task_sheet_row
+
+        sheet_id = self._task_sheet_id()
+        range_value = self._task_sheet_range()
+        encoded_range = urllib.parse.quote(range_value, safe="")
+        query = urllib.parse.urlencode({
+            "valueInputOption": "USER_ENTERED",
+            "insertDataOption": "INSERT_ROWS",
+        })
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(sheet_id, safe='')}"
+            f"/values/{encoded_range}:append?{query}"
+        )
+        body = json.dumps(
+            {"values": [build_task_sheet_row(record)]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self._task_sheet_http_timeout_seconds(),
+            ) as response:
+                response_text = response.read().decode("utf-8", errors="replace")
+                status = int(getattr(response, "status", 200) or 200)
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            return {
+                "status": "failed",
+                "returncode": exc.code,
+                "result": f"HTTP {exc.code}: {error_body}"[:500],
+            }
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return {"status": "failed", "returncode": 1, "result": str(exc)[:500]}
+
+        result_status = _google_sheet_tool_result_status(response_text)
+        succeeded = 200 <= status < 300 and result_status != "failed"
+        return {
+            "status": "succeeded" if succeeded else "failed",
+            "returncode": 0 if succeeded else status,
+            "result": response_text[:500],
+        }
+
+    async def _append_task_sheet_outbox_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        from gateway.task_ledger import (
+            record_task_sheet_append_result,
+            record_task_sheet_append_started,
+        )
+        from gateway.task_sheet_writer import build_task_sheet_row
+
+        task_id = str(record.get("task_id") or "")
+        sheet_id = self._task_sheet_id()
+        if not sheet_id:
+            record_task_sheet_append_result(
+                _hermes_home,
+                record,
+                blocked=True,
+                error="TELEGRAM_TASK_SHEET_ID is not configured",
+            )
+            return {"task_id": task_id, "status": "blocked", "error": "config_missing"}
+
+        mcp_access_token = self._source_sheet_mcp_access_token()
+        if mcp_access_token:
+            record_task_sheet_append_started(_hermes_home, record)
+            result = await asyncio.to_thread(
+                self._append_task_sheet_with_access_token_sync,
+                record,
+                access_token=mcp_access_token,
+            )
+            succeeded = str(result.get("status") or "") == "succeeded"
+            record_task_sheet_append_result(
+                _hermes_home,
+                record,
+                succeeded=succeeded,
+                error="" if succeeded else str(result.get("result") or ""),
+            )
+            return {
+                "task_id": task_id,
+                "status": "succeeded" if succeeded else "failed",
+                "returncode": result.get("returncode"),
+                "result": str(result.get("result") or "")[:500],
+            }
+
+        script_path = self._google_workspace_api_script_path()
+        if not script_path.exists():
+            record_task_sheet_append_result(
+                _hermes_home,
+                record,
+                blocked=True,
+                error=f"google_api.py not found: {script_path}",
+            )
+            return {"task_id": task_id, "status": "blocked", "error": "script_missing"}
+
+        record_task_sheet_append_started(_hermes_home, record)
+        values = json.dumps([build_task_sheet_row(record)], ensure_ascii=False)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script_path),
+            "sheets",
+            "append",
+            sheet_id,
+            self._task_sheet_range(),
+            "--values",
+            values,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await proc.communicate()
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        result_text = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+        result_status = _google_sheet_tool_result_status(result_text)
+        succeeded = proc.returncode == 0 and result_status != "failed"
+        record_task_sheet_append_result(
+            _hermes_home,
+            record,
+            succeeded=succeeded,
+            error="" if succeeded else result_text,
+        )
+        return {
+            "task_id": task_id,
+            "status": "succeeded" if succeeded else "failed",
+            "returncode": proc.returncode,
+            "result": result_text[:500],
+        }
+
+    async def _complete_task_sheet_outbox_pending(self, *, limit: int = 3) -> dict[str, int]:
+        from gateway.task_ledger import pending_task_sheet_outbox_records, record_task_sheet_append_result
+
+        records = pending_task_sheet_outbox_records(_hermes_home, limit=limit)
+        summary = {
+            "queued": len(records),
+            "attempted": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "blocked": 0,
+        }
+        for record in records:
+            summary["attempted"] += 1
+            try:
+                result = await self._append_task_sheet_outbox_record(record)
+            except Exception as exc:
+                record_task_sheet_append_result(_hermes_home, record, error=str(exc))
+                result = {"status": "failed"}
+            status = str(result.get("status") or "")
+            if status == "succeeded":
+                summary["succeeded"] += 1
+            elif status == "blocked":
+                summary["blocked"] += 1
+            else:
+                summary["failed"] += 1
+        if summary["attempted"]:
+            logger.info(
+                "Task Sheet outbox completion: queued=%d attempted=%d succeeded=%d failed=%d blocked=%d",
+                summary["queued"],
+                summary["attempted"],
+                summary["succeeded"],
+                summary["failed"],
+                summary["blocked"],
+            )
+        return summary
+
+    @staticmethod
+    def _task_sheet_replay_startup_limit() -> int:
+        raw = os.getenv("TELEGRAM_TASK_SHEET_REPLAY_STARTUP_LIMIT", "3")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 3
+
+    @staticmethod
+    def _task_sheet_replay_sweep_interval_seconds() -> float:
+        raw = os.getenv("TELEGRAM_TASK_SHEET_REPLAY_SWEEP_INTERVAL_SECONDS", "900")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 900.0
+
+    def _schedule_task_sheet_outbox_replay(self) -> int:
+        if not self._task_intake_enabled():
+            return 0
+        limit = self._task_sheet_replay_startup_limit()
+        if limit <= 0:
+            return 0
+        try:
+            from gateway.task_ledger import pending_task_sheet_outbox_records
+
+            pending = pending_task_sheet_outbox_records(_hermes_home, limit=limit)
+        except Exception as exc:
+            logger.warning("Task Sheet replay scan failed: %s", exc)
+            return 0
+        if not pending:
+            return 0
+        task = asyncio.create_task(self._complete_task_sheet_outbox_pending(limit=limit))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        logger.info("Scheduled task Sheet replay for %d pending task(s)", len(pending))
+        return len(pending)
+
+    def _maybe_schedule_task_sheet_outbox_sweep(self, *, now: float | None = None) -> int:
+        interval = self._task_sheet_replay_sweep_interval_seconds()
+        if interval <= 0:
+            return 0
+        now_ts = time.time() if now is None else float(now)
+        last_ts = float(getattr(self, "_last_task_sheet_replay_sweep_ts", 0.0) or 0.0)
+        if last_ts and now_ts - last_ts < interval:
+            return 0
+        self._last_task_sheet_replay_sweep_ts = now_ts
+        return self._schedule_task_sheet_outbox_replay()
+
+    async def _maybe_handle_task_intake(self, event: MessageEvent) -> Optional[str]:
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return None
+        if not self._task_intake_enabled() or not self._task_intake_chat_enabled(event):
+            return None
+        from gateway.task_intake import TaskIntakeRules, parse_task_intake
+        from gateway.task_ledger import record_task_intake
+
+        record = parse_task_intake(
+            event,
+            rules=TaskIntakeRules(
+                markers=self._task_intake_markers(),
+                default_status=os.getenv("TELEGRAM_TASK_DEFAULT_STATUS", "new").strip() or "new",
+            ),
+        )
+        if record is None:
+            return None
+
+        summary = record_task_intake(_hermes_home, record)
+        if summary.get("sheet_queued", 0) <= 0 and summary.get("duplicates", 0) > 0:
+            return "Записал задачу."
+
+        result = await self._append_task_sheet_outbox_record(record.to_dict())
+        return self._task_intake_ack(record, sheet_status=str(result.get("status") or "failed"))
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -6016,6 +6331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Process checkpoint recovery: %s", e)
 
         _recover_source_intake_on_gateway_startup()
+        _recover_task_intake_on_gateway_startup()
 
         # Suspend sessions that were active when the gateway last exited.
         # This prevents stuck sessions from being blindly resumed on restart,
@@ -6308,7 +6624,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
         self._schedule_source_intake_replay()
+        self._schedule_task_sheet_outbox_replay()
         self._last_source_replay_sweep_ts = time.time()
+        self._last_task_sheet_replay_sweep_ts = time.time()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -6740,6 +7058,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                 except Exception as _e:
                     logger.debug("Source intake replay sweep failed: %s", _e)
+
+                try:
+                    _task_sheet_scheduled = self._maybe_schedule_task_sheet_outbox_sweep()
+                    if _task_sheet_scheduled:
+                        logger.info(
+                            "Task Sheet replay sweep: scheduled %d pending task(s)",
+                            _task_sheet_scheduled,
+                        )
+                except Exception as _e:
+                    logger.debug("Task Sheet replay sweep failed: %s", _e)
 
                 # Periodically prune stale SessionStore entries.  The
                 # in-memory dict (and sessions.json) would otherwise grow
@@ -8017,6 +8345,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+
+        task_intake_ack = await self._maybe_handle_task_intake(event)
+        if task_intake_ack is not None:
+            return task_intake_ack
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -17629,6 +17962,25 @@ def _recover_source_intake_on_gateway_startup() -> dict[str, int]:
             summary.get("sources_seen", 0),
             summary.get("repaired_outbox", 0),
             summary.get("recovery_required", 0),
+        )
+    return summary
+
+
+def _recover_task_intake_on_gateway_startup() -> dict[str, int]:
+    try:
+        from gateway.task_ledger import recover_task_intake_pending
+
+        summary = recover_task_intake_pending(_hermes_home)
+    except Exception as exc:
+        logger.warning("Task intake startup recovery failed: %s", exc)
+        return {"tasks_seen": 0, "repaired_outbox": 0, "sheet_pending": 0}
+
+    if summary.get("repaired_outbox") or summary.get("sheet_pending"):
+        logger.info(
+            "Task intake startup recovery: tasks=%d repaired_outbox=%d sheet_pending=%d",
+            summary.get("tasks_seen", 0),
+            summary.get("repaired_outbox", 0),
+            summary.get("sheet_pending", 0),
         )
     return summary
 

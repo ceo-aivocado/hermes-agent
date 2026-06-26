@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -247,6 +247,16 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
     monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
 
     runner = GatewayRunner(GatewayConfig())
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="10954083",
+            name="Home",
+            thread_id="777",
+        ),
+    )
     adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
     runner.adapters[Platform.TELEGRAM] = adapter
     runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
@@ -272,15 +282,10 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
 
     await runner._run_process_watcher(watcher)
 
-    assert adapter.handle_message.await_count == 1
-    event = adapter.handle_message.await_args.args[0]
-    assert event.internal is True
-    assert event.source.platform == Platform.TELEGRAM
-    assert event.source.chat_id == "-100"
-    assert event.source.chat_type == "group"
-    assert event.source.thread_id == "42"
-    assert event.source.user_id == "user-42"
-    assert event.source.user_name == "alice"
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[0] == "10954083"
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "777"}
 
 
 @pytest.mark.asyncio

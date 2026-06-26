@@ -190,7 +190,8 @@ async def test_link_summary_records_source_before_agent_run(monkeypatch, tmp_pat
     )
 
     assert response is not None
-    assert "База: запись в Google Sheet не подтверждена" in response
+    assert response.strip() == "Конспект готов."
+    assert "База: запись в Google Sheet не подтверждена" not in response
 
     ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
     assert [row["event"] for row in ledger_rows] == ["source_discovered", "summary_created"]
@@ -244,12 +245,12 @@ async def test_link_summary_surfaces_missing_google_sheet_write(monkeypatch, tmp
 
     assert response is not None
     assert "Конспект готов." in response
-    assert "База: запись в Google Sheet не подтверждена" in response
+    assert "База: запись в Google Sheet не подтверждена" not in response
     assert "Google Sheet write was not confirmed" not in response
 
 
 @pytest.mark.asyncio
-async def test_link_summary_does_not_duplicate_agent_visible_sheet_auth_block(monkeypatch, tmp_path):
+async def test_link_summary_strips_agent_visible_sheet_auth_block_from_public_chat(monkeypatch, tmp_path):
     runner = _bootstrap_runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(
         return_value={
@@ -277,8 +278,9 @@ async def test_link_summary_does_not_duplicate_agent_visible_sheet_auth_block(mo
     )
 
     assert response is not None
-    assert response.count("KB/Sheet") == 1
-    assert "Google-авторизация не настроена" in response
+    assert response.strip() == "Конспект готов."
+    assert "KB/Sheet" not in response
+    assert "Google-авторизация не настроена" not in response
     assert "Google Sheet write was not confirmed" not in response
     assert "База: запись в Google Sheet не подтверждена" not in response
 
@@ -493,7 +495,7 @@ async def test_link_summary_keeps_sheet_failed_pending(monkeypatch, tmp_path):
     )
 
     assert response is not None
-    assert "База: запись в Google Sheet не подтверждена" in response
+    assert "База: запись в Google Sheet не подтверждена" not in response
 
     ledger_rows = _read_source_intake_jsonl(tmp_path, "source_ledger.jsonl")
     assert ledger_rows[-1]["event"] == "summary_created"

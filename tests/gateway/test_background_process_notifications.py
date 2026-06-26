@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.run import GatewayRunner, _parse_session_key
 
 
@@ -53,12 +53,13 @@ def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     return runner
 
 
-def _watcher_dict(session_id="proc_test", thread_id=""):
+def _watcher_dict(session_id="proc_test", thread_id="", chat_id="123", chat_type="dm"):
     d = {
         "session_id": session_id,
         "check_interval": 0,
         "platform": "telegram",
-        "chat_id": "123",
+        "chat_id": chat_id,
+        "chat_type": chat_type,
     }
     if thread_id:
         d["thread_id"] = thread_id
@@ -249,10 +250,59 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_public_telegram_group_background_output_routes_to_home_channel(monkeypatch, tmp_path):
+    """Background process output is operational detail and must not hit a public group."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(output_buffer="Traceback: boom\n", exited=True, exit_code=1)]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="10954083",
+            name="Home",
+            thread_id="777",
+        ),
+    )
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(
+        _watcher_dict(
+            chat_id="-1003716216649",
+            chat_type="group",
+            thread_id="644",
+        )
+    )
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[0] == "10954083"
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "777"}
+    assert adapter.send.await_args.args[0] != "-1003716216649"
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="10954083",
+            name="Home",
+            thread_id="777",
+        ),
+    )
     adapter = runner.adapters[Platform.TELEGRAM]
     runner.session_store._entries["agent:main:telegram:group:-100:42"] = SimpleNamespace(
         origin=SessionSource(
@@ -272,15 +322,10 @@ async def test_inject_watch_notification_routes_from_session_store_origin(monkey
 
     await runner._inject_watch_notification("[SYSTEM: Background process matched]", evt)
 
-    adapter.handle_message.assert_awaited_once()
-    synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.internal is True
-    assert synth_event.source.platform == Platform.TELEGRAM
-    assert synth_event.source.chat_id == "-100"
-    assert synth_event.source.chat_type == "group"
-    assert synth_event.source.thread_id == "42"
-    assert synth_event.source.user_id == "123"
-    assert synth_event.source.user_name == "Emiliyan"
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[0] == "10954083"
+    assert adapter.send.await_args.kwargs["metadata"] == {"thread_id": "777"}
 
 
 @pytest.mark.asyncio

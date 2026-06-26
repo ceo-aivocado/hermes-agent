@@ -175,6 +175,26 @@ _OWNER_ONLY_NOTICE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PUBLIC_TELEGRAM_INTERNAL_STATUS_RE = re.compile(
+    r"("
+    r"\bKB/Sheet\b"
+    r"|Google[-\s]?авторизац"
+    r"|Google\s+Sheets?.{0,120}(?:OAuth|не\s+настро|не\s+подтвержд|append|update|write)"
+    r"|Google\s+Sheet\s+write\s+was\s+not\s+confirmed"
+    r"|Sheets\s+append/update\s+tool\s+call"
+    r"|NotebookLM|n1m\s+login"
+    r"|Knowledge\s+Base.{0,120}(?:пропущ|очеред|backlog|не\s+выполн)"
+    r"|Запись\s+в\s+базу\s+знаний\s+не\s+выполн"
+    r"|База:.{0,160}(?:Google\s+Sheet|не\s+подтвержд|строк[аи]\s+в\s+таблиц|запис)"
+    r"|Конспект\s+отправлен\s+в\s+чат"
+    r"|Hermes\s+update"
+    r"|Gateway\s+restarted|Gateway\s+online"
+    r"|agent\.gateway_timeout|No\s+activity\s+for\s+\d+\s+min"
+    r"|Background\s+process|\[SYSTEM:\s*Background|Traceback:"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
 _CREDIT_BALANCE_DETAIL_RE = re.compile(
     r"\bcredits\s+balance:\s*\$([0-9][0-9,]*(?:\.\d+)?)\b",
     re.IGNORECASE,
@@ -415,6 +435,58 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
 def _is_owner_only_notice(text: str) -> bool:
     """Return True for operational notices that belong in owner/home chat only."""
     return bool(_OWNER_ONLY_NOTICE_RE.search(str(text or "")))
+
+
+def _is_public_telegram_target(platform: Any, chat_type: Any = "", chat_id: Any = "") -> bool:
+    """Return True for Telegram group/channel targets where internals must never leak."""
+    if _gateway_platform_value(platform) != "telegram":
+        return False
+    chat_type_value = str(chat_type or "").strip().lower()
+    if chat_type_value in {"dm", "private", "direct", "user"}:
+        return False
+    if chat_type_value in {"group", "supergroup", "channel"}:
+        return True
+    return str(chat_id or "").strip().startswith("-")
+
+
+def _is_public_telegram_source(source: Any) -> bool:
+    return _is_public_telegram_target(
+        getattr(source, "platform", None),
+        getattr(source, "chat_type", ""),
+        getattr(source, "chat_id", ""),
+    )
+
+
+def _looks_like_public_telegram_internal_status(text: str) -> bool:
+    return bool(_PUBLIC_TELEGRAM_INTERNAL_STATUS_RE.search(str(text or "")))
+
+
+def _strip_public_telegram_internal_status_blocks(text: str) -> str:
+    """Remove operational save/auth/update/status blocks from public Telegram replies."""
+    body = str(text or "")
+    if not body.strip() or not _looks_like_public_telegram_internal_status(body):
+        return body
+
+    kept_blocks: list[str] = []
+    for block in re.split(r"\n{2,}", body):
+        if _looks_like_public_telegram_internal_status(block):
+            continue
+        kept_lines = [
+            line
+            for line in block.splitlines()
+            if not _looks_like_public_telegram_internal_status(line)
+        ]
+        cleaned = "\n".join(kept_lines).strip()
+        if cleaned:
+            kept_blocks.append(cleaned)
+
+    return re.sub(r"\n{3,}", "\n\n", "\n\n".join(kept_blocks)).strip()
+
+
+def _sanitize_public_telegram_final_response(source: Any, text: str) -> str:
+    if not _is_public_telegram_source(source):
+        return text
+    return _strip_public_telegram_internal_status_blocks(text)
 
 
 def _looks_like_provider_billing_or_credits_error(text: str) -> bool:
@@ -821,6 +893,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
+        return None
+    if _looks_like_public_telegram_internal_status(text):
         return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
@@ -7827,6 +7901,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
+        if (
+            _is_public_telegram_source(source)
+            and _looks_like_public_telegram_internal_status(content)
+        ):
+            if await self._deliver_home_channel_notice(source.platform, content):
+                return
+            logger.warning(
+                "[%s] public Telegram technical notice suppressed because no home-channel delivery was available",
+                getattr(source.platform, "value", source.platform),
+            )
+            return
+
         if _is_owner_only_notice(content):
             if await self._deliver_home_channel_notice(source.platform, content):
                 return
@@ -10311,6 +10397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _looks_like_provider_billing_or_credits_error(response):
                     await self._send_owner_provider_billing_alert(source.platform, response)
                 response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_public_telegram_final_response(source, response)
                 if _event_requires_google_sheet_write(event):
                     _sheet_write_status = _agent_messages_google_sheet_write_status(agent_messages)
                     _sheet_write_attempted = _sheet_write_status != "none"
@@ -10330,7 +10417,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as _ledger_err:
                         logger.warning("Failed to record Telegram source ledger result: %s", _ledger_err)
                     if response and not _sheet_write_succeeded:
-                        response = _append_google_sheet_missing_notice(response)
+                        if _is_public_telegram_source(source):
+                            response = _sanitize_public_telegram_final_response(source, response)
+                        else:
+                            response = _append_google_sheet_missing_notice(response)
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -12824,6 +12914,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Resolve the adapter and chat_id for sending messages
         adapter = None
         chat_id = None
+        chat_type = None
+        platform = None
         session_key = None
         metadata = None
         for path in (claimed_path, pending_path):
@@ -12872,6 +12964,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._send_update_notification()
             return
 
+        delivery_chat_id = chat_id
+        delivery_metadata = metadata
+        suppress_update_delivery = False
+        if _is_public_telegram_target(platform, chat_type, chat_id):
+            home = self.config.get_home_channel(platform) if getattr(self, "config", None) else None
+            home_chat_id = getattr(home, "chat_id", None)
+            if home_chat_id:
+                delivery_chat_id = str(home_chat_id)
+                delivery_metadata = self._thread_metadata_for_target(
+                    platform,
+                    delivery_chat_id,
+                    getattr(home, "thread_id", None),
+                    adapter=adapter,
+                )
+            else:
+                suppress_update_delivery = True
+
         def _strip_ansi(text: str) -> str:
             return re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
 
@@ -12896,7 +13005,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chunks = [clean[i:i + max_chunk] for i in range(0, len(clean), max_chunk)]
             for chunk in chunks:
                 try:
-                    await adapter.send(chat_id, f"```\n{chunk}\n```", metadata=metadata)
+                    if suppress_update_delivery:
+                        logger.warning("Public Telegram update stream suppressed because no home-channel delivery was available")
+                        continue
+                    await adapter.send(delivery_chat_id, f"```\n{chunk}\n```", metadata=delivery_metadata)
                 except Exception as e:
                     logger.debug("Update stream send failed: %s", e)
 
@@ -12918,13 +13030,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     exit_code_raw = exit_code_path.read_text().strip() or "1"
                     exit_code = int(exit_code_raw)
-                    if exit_code == 0:
-                        await adapter.send(chat_id, "✅ Hermes update finished.", metadata=metadata)
+                    if suppress_update_delivery:
+                        logger.warning("Public Telegram update final notification suppressed because no home-channel delivery was available")
+                    elif exit_code == 0:
+                        await adapter.send(delivery_chat_id, "✅ Hermes update finished.", metadata=delivery_metadata)
                     else:
                         await adapter.send(
-                            chat_id,
+                            delivery_chat_id,
                             "❌ Hermes update failed (exit code {}).".format(exit_code),
-                            metadata=metadata,
+                            metadata=delivery_metadata,
                         )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 except Exception as e:
@@ -12968,28 +13082,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _flush_buffer()
                         # Try platform-native buttons first (Discord, Telegram)
                         sent_buttons = False
-                        if getattr(type(adapter), "send_update_prompt", None) is not None:
+                        if (
+                            not suppress_update_delivery
+                            and getattr(type(adapter), "send_update_prompt", None) is not None
+                        ):
                             try:
                                 await adapter.send_update_prompt(
-                                    chat_id=chat_id,
+                                    chat_id=delivery_chat_id,
                                     prompt=prompt_text,
                                     default=default,
                                     session_key=session_key,
-                                    metadata=metadata,
+                                    metadata=delivery_metadata,
                                 )
                                 sent_buttons = True
                             except Exception as btn_err:
                                 logger.debug("Button-based update prompt failed: %s", btn_err)
-                        if not sent_buttons:
+                        if not sent_buttons and not suppress_update_delivery:
                             default_hint = f" (default: {default})" if default else ""
                             _p = getattr(adapter, "typed_command_prefix", "/")
                             await adapter.send(
-                                chat_id,
+                                delivery_chat_id,
                                 f"⚕ **Update needs your input:**\n\n"
                                 f"{prompt_text}{default_hint}\n\n"
                                 f"Reply `{_p}approve` (yes) or `{_p}deny` (no), "
                                 f"or type your answer directly.",
-                                metadata=metadata,
+                                metadata=delivery_metadata,
                             )
                         # Keep the prompt marker on disk until the user
                         # answers. If the gateway restarts mid-prompt, the
@@ -13010,11 +13127,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             exit_code_path.write_text("124")
             await _flush_buffer()
             try:
-                await adapter.send(
-                    chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
-                    metadata=metadata,
-                )
+                if suppress_update_delivery:
+                    logger.warning("Public Telegram update timeout suppressed because no home-channel delivery was available")
+                else:
+                    await adapter.send(
+                        delivery_chat_id,
+                        "❌ Hermes update timed out after 30 minutes.",
+                        metadata=delivery_metadata,
+                    )
             except Exception:
                 pass
             for p in (pending_path, claimed_path, output_path,
@@ -13119,7 +13239,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     msg = "✅ Hermes update finished successfully."
                 else:
                     msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                await adapter.send(chat_id, msg, metadata=metadata)
+                if _is_public_telegram_target(platform, chat_type, chat_id):
+                    if not await self._deliver_home_channel_notice(platform, msg):
+                        logger.warning(
+                            "Public Telegram update notification suppressed because no home-channel delivery was available"
+                        )
+                else:
+                    await adapter.send(chat_id, msg, metadata=metadata)
                 logger.info(
                     "Sent post-update notification to %s:%s (exit=%s)",
                     platform_str,
@@ -13733,6 +13859,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return
         try:
+            if (
+                _is_public_telegram_source(source)
+                and _looks_like_public_telegram_internal_status(synth_text)
+            ):
+                if not await self._deliver_home_channel_notice(source.platform, synth_text):
+                    logger.warning(
+                        "Public Telegram watch notification suppressed because no home-channel delivery was available"
+                    )
+                return
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -13770,6 +13905,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key = watcher.get("session_key", "")
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
+        chat_type = watcher.get("chat_type", "")
         thread_id = watcher.get("thread_id", "")
         user_id = watcher.get("user_id", "")
         user_name = watcher.get("user_name", "")
@@ -13833,6 +13969,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "session_key": session_key,
                         "platform": platform_name,
                         "chat_id": chat_id,
+                        "chat_type": chat_type,
                         "thread_id": thread_id,
                         "user_id": user_id,
                         "user_name": user_name,
@@ -13851,6 +13988,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             break
                     if adapter and source.chat_id:
                         try:
+                            if (
+                                _is_public_telegram_source(source)
+                                and _looks_like_public_telegram_internal_status(synth_text)
+                            ):
+                                await self._deliver_home_channel_notice(source.platform, synth_text)
+                                break
                             synth_event = MessageEvent(
                                 text=synth_text,
                                 message_type=MessageType.TEXT,
@@ -13890,7 +14033,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if adapter and chat_id:
                         try:
                             send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(chat_id, message_text, metadata=send_meta)
+                            platform = Platform(platform_name)
+                            if _is_public_telegram_target(platform, chat_type, chat_id):
+                                await self._deliver_home_channel_notice(platform, message_text)
+                            else:
+                                await adapter.send(chat_id, message_text, metadata=send_meta)
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
                 break
@@ -13911,7 +14058,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if adapter and chat_id:
                     try:
                         send_meta = {"thread_id": thread_id} if thread_id else None
-                        await adapter.send(chat_id, message_text, metadata=send_meta)
+                        platform = Platform(platform_name)
+                        if _is_public_telegram_target(platform, chat_type, chat_id):
+                            await self._deliver_home_channel_notice(platform, message_text)
+                        else:
+                            await adapter.send(chat_id, message_text, metadata=send_meta)
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
 

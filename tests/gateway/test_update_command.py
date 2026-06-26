@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -33,8 +33,22 @@ def _make_runner():
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
+    runner.config = GatewayConfig()
     runner._voice_mode = {}
     return runner
+
+
+def _configure_telegram_home(runner):
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="10954083",
+            name="Home",
+            thread_id="777",
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +741,38 @@ class TestSendUpdateNotification:
         sent_text = mock_adapter.send.call_args[0][1]
         assert "update failed" in sent_text.lower()
         assert "Traceback: boom" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_public_telegram_group_update_notification_routes_to_home_channel(self, tmp_path):
+        """Technical update output must not be posted back into a public group."""
+        runner = _make_runner()
+        _configure_telegram_home(runner)
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+
+        pending = {
+            "platform": "telegram",
+            "chat_id": "-1003716216649",
+            "chat_type": "group",
+            "thread_id": "644",
+            "message_id": "msg-update",
+            "user_id": "12345",
+        }
+        (hermes_home / ".update_pending.json").write_text(json.dumps(pending))
+        (hermes_home / ".update_output.txt").write_text("Traceback: update exploded")
+        (hermes_home / ".update_exit_code").write_text("1")
+
+        mock_adapter = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            result = await runner._send_update_notification()
+
+        assert result is True
+        mock_adapter.send.assert_called_once()
+        assert mock_adapter.send.call_args.args[0] == "10954083"
+        assert mock_adapter.send.call_args.kwargs["metadata"] == {"thread_id": "777"}
+        assert "-1003716216649" not in mock_adapter.send.call_args.args
 
     @pytest.mark.asyncio
     async def test_sends_generic_message_when_no_output(self, tmp_path):

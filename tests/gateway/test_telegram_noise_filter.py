@@ -25,6 +25,18 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
 
 
+def test_telegram_status_suppresses_kb_sheet_auth_noise():
+    noisy_messages = [
+        "Конспект отправлен в чат. Запись в базу знаний не выполнена: NotebookLM — аутентификация протухла.",
+        "Google Sheets — OAuth не настроен.",
+        "⚠️ База: запись в Google Sheet не подтверждена. Конспект создан, но строка в таблице не была записана.",
+        "⚠️ KB/Sheet: Google-авторизация не настроена — запись в Knowledge Base пропущена.",
+    ]
+
+    for message in noisy_messages:
+        assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
+
+
 def test_non_telegram_status_is_unchanged():
     """The Telegram quieting policy must not hide CLI/Discord diagnostics."""
     message = "⏳ Retrying in 4.2s (attempt 1/3)..."

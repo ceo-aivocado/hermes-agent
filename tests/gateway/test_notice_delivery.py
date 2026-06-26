@@ -152,6 +152,39 @@ async def test_provider_billing_alert_routes_to_home_channel_not_source_group(mo
 
 
 @pytest.mark.asyncio
+async def test_public_telegram_technical_notice_routes_to_home_channel_not_source_group():
+    runner, adapter = _make_telegram_runner()
+    source = _make_telegram_group_source()
+    content = (
+        "⚠️ База: запись в Google Sheet не подтверждена. "
+        "NotebookLM — аутентификация протухла, Google Sheets — OAuth не настроен."
+    )
+
+    await runner._deliver_platform_notice(source, content)
+
+    adapter.send.assert_awaited_once_with(
+        "10954083",
+        content,
+        metadata={"thread_id": "777"},
+    )
+    adapter.send_private_notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_telegram_technical_notice_is_suppressed_without_home_channel():
+    runner, adapter = _make_telegram_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = None
+
+    await runner._deliver_platform_notice(
+        _make_telegram_group_source(),
+        "Google Sheets OAuth не настроен — запись в Knowledge Base пропущена.",
+    )
+
+    adapter.send.assert_not_awaited()
+    adapter.send_private_notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_provider_billing_alert_is_capped_to_one_per_day(monkeypatch, tmp_path):
     runner, adapter = _make_telegram_runner()
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
